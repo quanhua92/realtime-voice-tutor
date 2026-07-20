@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local config — never commit secrets
+.env
+.env.local
+.env.*.local
+
+# Vendored model files (large, fetched via scripts/download_models.py)
+models/
+
+# Build artifacts
+dist/
+build/
+
+# Logs
+*.log
+logs/
+
+# Coverage
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
