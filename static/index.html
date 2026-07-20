@@ -113,6 +113,21 @@
             color: #86efac;
         }
 
+        .msg.assistant strong { color: #bbf7d0; font-weight: 700; }
+        .msg.assistant em { color: #bef264; font-style: italic; }
+        .msg.assistant code {
+            background: rgba(30, 41, 59, 0.6);
+            color: #fbbf24;
+            padding: 1px 6px;
+            border-radius: 4px;
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-size: 13px;
+        }
+        .msg.assistant ul, .msg.assistant ol {
+            margin: 6px 0 6px 20px;
+        }
+        .msg.assistant li { margin: 2px 0; }
+
         .msg.system {
             align-self: center;
             background: transparent;
@@ -221,7 +236,9 @@
                 return;
             }
 
-            ws = new WebSocket(`ws://${location.host}/ws/voice`);
+            // Use wss:// when page is HTTPS (avoids mixed-content blocking)
+            const wsScheme = location.protocol === 'https:' ? 'wss' : 'ws';
+            ws = new WebSocket(`${wsScheme}://${location.host}/ws/voice`);
             ws.binaryType = 'arraybuffer';
 
             ws.onopen = async () => {
@@ -396,9 +413,53 @@
             const chat = document.getElementById('chat');
             const div = document.createElement('div');
             div.className = `msg ${role}`;
-            div.textContent = text;
+            if (role === 'assistant') {
+                // Render a small subset of markdown: **bold**, *italic*,
+                // `code`, and newlines. HTML is escaped first to prevent
+                // any injection from LLM output.
+                div.innerHTML = renderMarkdown(text);
+            } else {
+                // User + system messages: plain text only.
+                div.textContent = text;
+            }
             chat.appendChild(div);
             chat.scrollTop = chat.scrollHeight;
+        }
+
+        function renderMarkdown(text) {
+            // 1. Escape HTML first — everything below inserts known-safe tags.
+            let s = text
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;');
+
+            // 2. Inline code (`...`) — apply before * and ** so the asterisks
+            //    inside code aren't reinterpreted.
+            s = s.replace(/`([^`]+)`/g, '<code>$1</code>');
+
+            // 3. Bold (**...**) — apply before italic so ** beats *.
+            s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+
+            // 4. Italic (*...*) — single asterisks not adjacent to another *.
+            s = s.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>');
+
+            // 5. Bullet lists: lines starting with "- " become <ul><li>.
+            //    Collapse consecutive bullet lines into one <ul>.
+            s = s.replace(/(?:^|\n)(?:- (.+)(?:\n|$))+/g, (block) => {
+                const items = block.trim().split(/\n/).map(
+                    line => line.replace(/^- /, '').trim()
+                );
+                return '\n<ul>' + items.map(i => `<li>${i}</li>`).join('') + '</ul>';
+            });
+
+            // 6. Newlines → <br> (after list handling, so <ul> blocks stay clean)
+            s = s.replace(/\n/g, '<br>');
+
+            // 7. Tidy: <br> right before <ul> or after </ul>
+            s = s.replace(/<br>(<ul>)/g, '$1')
+                 .replace(/(<\/ul>)<br>/g, '$1');
+
+            return s;
         }
     </script>
 </body>
