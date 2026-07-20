@@ -4,7 +4,59 @@
 
 **Goal:** Build a fully-local, sub-500ms real-time voice agent for **casual English conversation practice**, featuring **Streaming ASR**, **Semantic VAD with Echo Cancellation**, **Agentic LLM Tool Loops (MCP)**, **Local Kokoro TTS**, and **4-Step Full-Duplex Barge-in Interruption with State Reconstruction**.
 
-> 💡 **Everything runs locally** — no cloud dependencies. Silero VAD, Faster-Whisper ASR, Ollama LLM, and Kokoro TTS all run on your machine. To swap in cloud providers (Groq, NVIDIA NIM), just change endpoint URLs in `config.py`.
+> 💡 **Everything runs locally** — no cloud dependencies. Silero VAD, Faster-Whisper ASR, Ollama LLM, and Kokoro TTS all run on your machine. To swap in cloud providers (Groq, NVIDIA NIM), just change `OPENAI_BASE_URL` in `config.py`.
+
+---
+
+## ⚡ LOCKED DECISIONS (supersedes detail below)
+
+> The narrative phases below were the original draft. The decisions in this section are **authoritative**; where any phase snippet contradicts this section, this section wins. Implemented in 11 reviewable commits (see `docs/COMMIT_PLAN.md`).
+
+### Architecture
+
+| Concern | Decision |
+|---|---|
+| LLM API | **OpenAI `/v1/chat/completions`** on Ollama (`http://localhost:11434/v1`). Standard, swappable with Groq/NVIDIA NIM by changing `OPENAI_BASE_URL` + `OPENAI_API_KEY`. |
+| Tool result format | `{"role": "tool", "tool_call_id": "<id>", "content": "..."}` (OpenAI standard). Tool `arguments` is a **JSON string**, not dict. |
+| Mic capture | **AudioWorklet** at native rate → resample to 16kHz inside the worklet. Replaces deprecated `ScriptProcessor`; fixes 48k-vs-16k chunk-size bug. |
+| TTS playback | Single `AudioContext` at native rate; per-chunk upsample 24kHz → native. Browsers ignore non-standard `sampleRate` ctor arg. |
+| VAD silence timeout | **500ms** (down from draft's 800ms). Aggressive but responsive. Configurable via `VAD_SILENCE_TIMEOUT_MS`. |
+| Sync CPU work | All blocking calls wrapped in `asyncio.to_thread()`. Barge-in `task.cancel()` propagates within one event-loop tick. |
+| Model lifecycles | Loaded **once at startup** (FastAPI `lifespan`), shared across sessions. Avoids 5–30s WS handshake stall. |
+| TTS mode | Per-sentence streaming via `kokoro.create_stream()`. Lowest TTFA. |
+| Silero VAD | `silero-vad` pip package (MIT). No `torch` dependency. True offline. |
+| Kokoro model files | **v1.0** (`kokoro-v1.0.onnx` + `voices-v1.0.bin`). Draft's `v0_19` is outdated. Plus `misaki` g2p package. |
+
+### Latency budget (revised)
+
+| Stage | Target |
+|---|---|
+| Mic + AEC + Worklet + resample | **15ms** |
+| VAD per chunk (off-thread) | **2ms** |
+| Endpointing silence (perceived, not in TTFA) | **500ms** |
+| ASR `tiny.en` INT8 | **90ms** |
+| LLM TTFT (llama3.2:3b) | **180ms** |
+| TTS first stream chunk | **60ms** |
+| Network + buffer | **20ms** |
+| **TTFA (speech-end → audio)** | **~370ms** ✅ |
+| **Perceived (silence + TTFA)** | **~870ms** |
+
+### Barge-in fixes (vs. original draft)
+
+1. **Don't discard interrupting chunk** — on barge-in, seed new `audio_buffer` with the current chunk + `pre_speech_buffer` so the user's interrupting word is captured.
+2. **Concurrent-pipeline guard** — `if session.active_task and not session.active_task.done(): cancel + await sleep(0)` before launching new pipeline.
+3. **Tool result uses `tool_call_id`** (OpenAI format, not Ollama's `tool_name` field).
+4. **Tool `arguments` is JSON string** (OpenAI format).
+5. **All blocking calls in `asyncio.to_thread`** so `task.cancel()` actually preempts mid-synthesis.
+6. **State reconstruction based on `words_spoken`** only (sentences actually synthesized), not buffered text.
+
+### Out of scope (acceptable for POC)
+
+- No WebSocket auth.
+- No conversation persistence.
+- English-only.
+- Approximate state reconstruction (no client `bytes_played` feedback).
+- Single-user load-testing.
 
 ---
 
@@ -78,10 +130,11 @@ realtime-voice-tutor/
 ├── .env.example                # Environment variable template
 ├── config.py                   # Centralized config with env overrides
 ├── server.py                   # FastAPI WebSocket Orchestrator & Barge-in
+├── engines.py                  # Shared singleton engine registry (startup)
 ├── vad_engine.py               # Silero VAD with echo-aware thresholds
 ├── asr_engine.py               # Faster-Whisper ASR worker
-├── llm_engine.py               # Ollama streaming + tool-calling loop
-├── tts_engine.py               # Kokoro ONNX local TTS
+├── llm_engine.py               # OpenAI-compatible streaming + tool-calling loop
+├── tts_engine.py               # Kokoro ONNX local TTS (per-sentence streaming)
 ├── mcp_tools.py                # MCP tool definitions (scenario, phrases, vocab)
 ├── data_loader.py              # Markdown + frontmatter loader & filter
 ├── data/
@@ -96,10 +149,26 @@ realtime-voice-tutor/
 │       ├── a2-beginner.md
 │       ├── b1-intermediate.md
 │       └── b2-upper.md
+├── models/                     # Vendored model files (gitignored)
+│   ├── silero_vad.onnx
+│   ├── kokoro-v1.0.onnx
+│   └── voices-v1.0.bin
+├── scripts/
+│   └── download_models.py      # One-time model download script
 ├── static/
-│   └── index.html              # WebAudio UI with visualizer & barge-in
+│   ├── index.html              # WebAudio UI with visualizer & barge-in
+│   ├── worker.js               # AudioWorklet main-thread glue
+│   └── resample-processor.js   # AudioWorkletProcessor (native→16kHz)
+├── tests/                      # pytest unit + integration tests
+│   ├── test_data_loader.py
+│   ├── test_mcp_tools.py
+│   ├── test_vad_engine.py
+│   ├── test_asr_engine.py
+│   ├── test_llm_engine.py
+│   └── test_tts_engine.py
 └── docs/
-    └── PLAN.md
+    ├── PLAN.md
+    └── COMMIT_PLAN.md          # 11-commit execution plan
 ```
 
 ---
@@ -108,54 +177,75 @@ realtime-voice-tutor/
 
 ### 1.1 Dependencies
 
+> ⚡ **UPDATED** — see Locked Decisions at top. Notably: no `torch` (use `silero-vad` pip package + `onnxruntime`), add `openai` SDK (OpenAI-compat client), add `misaki` (Kokoro g2p), add `pytest`.
+
 ```bash
 cd realtime-voice-tutor
 uv init
 uv venv .venv --python 3.12
 source .venv/bin/activate
 
-uv add fastapi uvicorn[standard] websockets numpy
-uv add torch torchaudio                    # Silero VAD runtime
-uv add faster-whisper                       # CTranslate2 ASR
-uv add kokoro-onnx                          # Local TTS engine
-uv add httpx                               # Async HTTP for Ollama API
-uv add python-frontmatter                  # Markdown frontmatter parser
-uv add python-dotenv                       # .env loading
+uv add fastapi 'uvicorn[standard]' websockets numpy
+uv add silero-vad                       # MIT wrapper, loads ONNX cleanly
+uv add faster-whisper                   # CTranslate2 ASR
+uv add kokoro-onnx misaki               # Local TTS engine + g2p
+uv add openai                           # OpenAI-compatible client (works with Ollama)
+uv add httpx                            # Async HTTP fallback
+uv add python-frontmatter               # Markdown frontmatter parser
+uv add python-dotenv                    # .env loading
+uv add --dev pytest pytest-asyncio      # Testing
 ```
 
-> ⚠️ **Note:** `silero-vad` is NOT a pip package. It loads via `torch.hub` at runtime. Do not add it to dependencies.
+> ⚠️ **Notes:**
+> - `silero-vad` is a pip package that wraps the ONNX model + LSTM state management. No `torch.hub` network fetch.
+> - `kokoro-onnx` v1.0 requires the `kokoro-v1.0.onnx` + `voices-v1.0.bin` model files (see `scripts/download_models.py`).
+> - `openai` SDK points at `OPENAI_BASE_URL=http://localhost:11434/v1` for local Ollama; change URL/key for cloud providers.
 
 ### 1.2 Configuration (`config.py`)
+
+> ⚡ **UPDATED** — uses OpenAI-compat env vars; `VAD_SILENCE_TIMEOUT_MS=500`; models in `models/` subdir; new `LLM_HISTORY_TURNS`, `TTS_STREAM`, `LOG_LATENCY`.
 
 ```python
 # config.py
 from dotenv import load_dotenv
 import os
+from pathlib import Path
 
 load_dotenv()
 
-# --- LLM ---
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
+BASE_DIR = Path(__file__).parent
+MODELS_DIR = BASE_DIR / "models"
+
+# --- LLM (OpenAI-compatible; works with Ollama, Groq, NVIDIA NIM) ---
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "http://localhost:11434/v1")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "ollama")  # required by SDK, value unused for local Ollama
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "llama3.2:3b")
+LLM_HISTORY_TURNS = int(os.getenv("LLM_HISTORY_TURNS", "10"))  # last N messages kept as context
+LLM_MAX_TOOL_ROUNDS = int(os.getenv("LLM_MAX_TOOL_ROUNDS", "3"))
 
 # --- ASR ---
 ASR_MODEL_SIZE = os.getenv("ASR_MODEL_SIZE", "tiny.en")
 ASR_DEVICE = os.getenv("ASR_DEVICE", "cpu")
+ASR_COMPUTE_TYPE = os.getenv("ASR_COMPUTE_TYPE", "int8")
 
 # --- VAD ---
 VAD_THRESHOLD = float(os.getenv("VAD_THRESHOLD", "0.6"))
 VAD_BARGE_IN_THRESHOLD = float(os.getenv("VAD_BARGE_IN_THRESHOLD", "0.92"))
-VAD_SILENCE_TIMEOUT_MS = int(os.getenv("VAD_SILENCE_TIMEOUT_MS", "800"))
+VAD_SILENCE_TIMEOUT_MS = int(os.getenv("VAD_SILENCE_TIMEOUT_MS", "500"))  # 500ms (aggressive endpointing)
+SILERO_MODEL_PATH = os.getenv("SILERO_MODEL_PATH", str(MODELS_DIR / "silero_vad.onnx"))
 
 # --- TTS ---
-TTS_VOICE = os.getenv("TTS_VOICE", "af_heart")
+TTS_VOICE = os.getenv("TTS_VOICE", "af_sarah")
 TTS_SPEED = float(os.getenv("TTS_SPEED", "1.0"))
-KOKORO_MODEL_PATH = os.getenv("KOKORO_MODEL_PATH", "kokoro-v0_19.onnx")
-KOKORO_VOICES_PATH = os.getenv("KOKORO_VOICES_PATH", "voices.bin")
+TTS_LANG = os.getenv("TTS_LANG", "en-us")
+TTS_STREAM = os.getenv("TTS_STREAM", "true").lower() == "true"
+KOKORO_MODEL_PATH = os.getenv("KOKORO_MODEL_PATH", str(MODELS_DIR / "kokoro-v1.0.onnx"))
+KOKORO_VOICES_PATH = os.getenv("KOKORO_VOICES_PATH", str(MODELS_DIR / "voices-v1.0.bin"))
 
 # --- Server ---
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8888"))
+LOG_LATENCY = os.getenv("LOG_LATENCY", "true").lower() == "true"
 
 # --- System Prompt ---
 SYSTEM_PROMPT = """You are a friendly English conversation practice tutor called VoiceTutor.
@@ -176,26 +266,36 @@ then role-play that scenario with them. Use lookup_phrases to help when they're 
 
 ### 1.3 Environment Template (`.env.example`)
 
+> ⚡ **UPDATED** — OpenAI-compat env vars.
+
 ```env
-# LLM
-OLLAMA_BASE_URL=http://localhost:11434
-OLLAMA_MODEL=llama3.2:3b
+# LLM (OpenAI-compatible — works with Ollama, Groq, NVIDIA NIM)
+OPENAI_BASE_URL=http://localhost:11434/v1
+OPENAI_API_KEY=ollama
+OPENAI_MODEL=llama3.2:3b
+LLM_HISTORY_TURNS=10
+LLM_MAX_TOOL_ROUNDS=3
 
 # ASR
 ASR_MODEL_SIZE=tiny.en
+ASR_DEVICE=cpu
+ASR_COMPUTE_TYPE=int8
 
 # VAD
 VAD_THRESHOLD=0.6
 VAD_BARGE_IN_THRESHOLD=0.92
-VAD_SILENCE_TIMEOUT_MS=800
+VAD_SILENCE_TIMEOUT_MS=500
 
 # TTS
-TTS_VOICE=af_heart
+TTS_VOICE=af_sarah
 TTS_SPEED=1.0
+TTS_LANG=en-us
+TTS_STREAM=true
 
 # Server
 HOST=0.0.0.0
 PORT=8888
+LOG_LATENCY=true
 ```
 
 ---
@@ -394,36 +494,47 @@ class DataLoader:
 
 ## 🎙️ Phase 3: Semantic VAD Engine (`vad_engine.py`)
 
+> ⚡ **UPDATED** — uses `silero-vad` pip package (no torch dep). All blocking work wrapped for off-thread execution. 500ms silence timeout.
+
 Echo-aware VAD that uses higher thresholds during agent speech to prevent false barge-in from speaker feedback.
 
 ```python
 # vad_engine.py
-import torch
 import numpy as np
-from config import VAD_THRESHOLD, VAD_BARGE_IN_THRESHOLD, VAD_SILENCE_TIMEOUT_MS
+from silero_vad import load_silero_vad, get_speech_timestamps
+from config import (
+    VAD_THRESHOLD,
+    VAD_BARGE_IN_THRESHOLD,
+    VAD_SILENCE_TIMEOUT_MS,
+    SILERO_MODEL_PATH,
+)
 
 
 class VADEngine:
-    """Silero VAD with echo-aware dynamic thresholds."""
+    """Silero VAD with echo-aware dynamic thresholds.
+
+    Note: this engine is loaded ONCE at startup and shared across all sessions.
+    The per-session mutable state (is_speaking, silence_frames) is tracked by
+    the Session class in server.py via reset()/process_chunk() return values.
+    For simplicity we keep state inside the engine and let the server call
+    reset() on barge-in.
+    """
 
     CHUNK_SAMPLES = 512  # Silero accepts 256, 512, or 768 @ 16kHz
 
     def __init__(self, sample_rate: int = 16000):
         self.sample_rate = sample_rate
-        self.model, _ = torch.hub.load(
-            repo_or_dir="snakers4/silero-vad",
-            model="silero_vad",
-            force_reload=False,
-            onnx=True,
-        )
+        # silero-vad pip package: returns a VADModel with reset_states() / __call__
+        self.model = load_silero_vad(onnx=True)
+
         # Silence tracking for end-of-speech detection
         self.silence_frames = 0
-        self.silence_timeout_frames = int(
-            VAD_SILENCE_TIMEOUT_MS / (self.CHUNK_SAMPLES / sample_rate * 1000)
-        )
+        chunk_ms = self.CHUNK_SAMPLES / sample_rate * 1000
+        self.silence_timeout_frames = int(VAD_SILENCE_TIMEOUT_MS / chunk_ms)
         self.is_speaking = False
 
     def reset(self) -> None:
+        """Reset internal state (call on barge-in)."""
         self.model.reset_states()
         self.silence_frames = 0
         self.is_speaking = False
@@ -438,16 +549,17 @@ class VADEngine:
             - speech_prob: float (0.0 - 1.0)
             - is_speech: bool (above active threshold)
             - speech_ended: bool (silence timeout reached after speech)
+
+        This method is synchronous CPU work; the server should call it via
+        asyncio.to_thread() to avoid blocking the event loop.
         """
         audio_int16 = np.frombuffer(pcm_bytes, dtype=np.int16)
         audio_float32 = audio_int16.astype(np.float32) / 32768.0
-        tensor = torch.from_numpy(audio_float32)
 
-        speech_prob = self.model(tensor, self.sample_rate).item()
+        speech_prob = float(self.model(audio_float32, self.sample_rate).item())
 
         # Echo-aware threshold: raised during agent TTS to reject echo bleed
         threshold = VAD_BARGE_IN_THRESHOLD if agent_is_speaking else VAD_THRESHOLD
-
         is_speech = speech_prob > threshold
 
         # Track speech start/end with silence timeout
@@ -663,99 +775,133 @@ TOOL_SCHEMAS = [
 
 ### 5.2 Streaming LLM Engine with Tool Loop (`llm_engine.py`)
 
+> ⚡ **UPDATED** — uses `openai` SDK pointed at OpenAI-compatible endpoint (`/v1/chat/completions`). Tool format follows OpenAI standard (`tool_call_id`, JSON-string `arguments`).
+
 ```python
 # llm_engine.py
-import httpx
+import asyncio
 import json
 from typing import AsyncIterator
-from config import OLLAMA_BASE_URL, OLLAMA_MODEL, SYSTEM_PROMPT
+from openai import AsyncOpenAI
+from config import (
+    OPENAI_BASE_URL,
+    OPENAI_API_KEY,
+    OPENAI_MODEL,
+    SYSTEM_PROMPT,
+    LLM_HISTORY_TURNS,
+    LLM_MAX_TOOL_ROUNDS,
+)
 from mcp_tools import TOOL_SCHEMAS, TOOL_REGISTRY
 
 
 class LLMEngine:
-    """Async streaming LLM with Ollama tool-calling loop."""
+    """Async streaming LLM (OpenAI-compatible) with tool-calling loop.
+
+    Works with Ollama, Groq, NVIDIA NIM, or OpenAI itself — anything that
+    exposes POST /v1/chat/completions with streaming + tools.
+    """
 
     def __init__(self):
-        self.client = httpx.AsyncClient(timeout=30.0)
-        self.chat_url = f"{OLLAMA_BASE_URL}/api/chat"
+        self.client = AsyncOpenAI(
+            base_url=OPENAI_BASE_URL,
+            api_key=OPENAI_API_KEY,
+            timeout=30.0,
+        )
+        self.model = OPENAI_MODEL
 
     async def generate_stream(
         self, messages: list[dict]
     ) -> AsyncIterator[str]:
         """
         Stream LLM response tokens. Handles tool calls automatically:
-        if the model requests a tool, executes it and continues generation.
-
-        Yields text tokens as they arrive.
+        if the model requests a tool, executes it (off-thread) and continues
+        generation. Yields text tokens as they arrive.
         """
-        # Ensure system prompt is first
-        full_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-        # Keep last 10 turns for context window management
-        full_messages.extend(messages[-10:])
+        # System prompt first, then last N turns
+        full_messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        full_messages.extend(messages[-LLM_HISTORY_TURNS:])
 
-        max_tool_rounds = 3  # Prevent infinite tool loops
-
-        for _ in range(max_tool_rounds):
-            payload = {
-                "model": OLLAMA_MODEL,
-                "messages": full_messages,
-                "tools": TOOL_SCHEMAS,
-                "stream": True,
-            }
+        for _ in range(LLM_MAX_TOOL_ROUNDS):
+            stream = await self.client.chat.completions.create(
+                model=self.model,
+                messages=full_messages,
+                tools=TOOL_SCHEMAS,
+                stream=True,
+            )
 
             accumulated_text = ""
-            tool_calls = []
+            tool_calls: dict[int, dict] = {}  # index -> {id, name, arguments_str}
 
-            async with self.client.stream(
-                "POST", self.chat_url, json=payload
-            ) as response:
-                async for line in response.aiter_lines():
-                    if not line.strip():
-                        continue
-                    chunk = json.loads(line)
-                    msg = chunk.get("message", {})
+            async for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
 
-                    # Yield streamed text tokens
-                    token = msg.get("content", "")
-                    if token:
-                        accumulated_text += token
-                        yield token
+                # Yield streamed text tokens
+                if delta.content:
+                    accumulated_text += delta.content
+                    yield delta.content
 
-                    # Collect tool calls
-                    if msg.get("tool_calls"):
-                        tool_calls.extend(msg["tool_calls"])
+                # Accumulate tool calls across chunks (OpenAI streams them
+                # in pieces keyed by `index`)
+                if delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        idx = tc.index or 0
+                        slot = tool_calls.setdefault(
+                            idx, {"id": "", "name": "", "arguments_str": ""}
+                        )
+                        if tc.id:
+                            slot["id"] = tc.id
+                        if tc.function and tc.function.name:
+                            slot["name"] = tc.function.name
+                        if tc.function and tc.function.arguments:
+                            slot["arguments_str"] += tc.function.arguments
 
             # If no tool calls, we're done
             if not tool_calls:
                 return
 
-            # Execute tool calls and add results to messages
-            full_messages.append({
-                "role": "assistant",
-                "content": accumulated_text,
-                "tool_calls": tool_calls,
-            })
+            # Append the assistant message with tool_calls (OpenAI requires
+            # content AND tool_calls fields, with arguments as JSON string)
+            assistant_msg: dict = {"role": "assistant", "content": accumulated_text or None}
+            assistant_msg["tool_calls"] = [
+                {
+                    "id": slot["id"],
+                    "type": "function",
+                    "function": {
+                        "name": slot["name"],
+                        "arguments": slot["arguments_str"] or "{}",
+                    },
+                }
+                for slot in tool_calls.values()
+            ]
+            full_messages.append(assistant_msg)
 
-            for tc in tool_calls:
-                func_name = tc["function"]["name"]
-                func_args = tc["function"].get("arguments", {})
+            # Execute each tool off-thread and append results
+            for slot in tool_calls.values():
+                func_name = slot["name"]
+                try:
+                    func_args = json.loads(slot["arguments_str"] or "{}")
+                except json.JSONDecodeError:
+                    func_args = {}
+
                 handler = TOOL_REGISTRY.get(func_name)
-
                 if handler:
-                    result = handler(**func_args)
+                    result = await asyncio.to_thread(handler, **func_args)
                 else:
                     result = f"Unknown tool: {func_name}"
 
-                full_messages.append({
-                    "role": "tool",
-                    "content": str(result),
-                })
-
-            # Clear for next round — LLM will generate response using tool results
-            tool_calls = []
+                # OpenAI tool result format: role + tool_call_id + content
+                full_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": slot["id"],
+                        "content": str(result),
+                    }
+                )
 
     async def close(self):
-        await self.client.aclose()
+        await self.client.close()
 ```
 
 
@@ -763,51 +909,79 @@ class LLMEngine:
 
 ## 🔊 Phase 6: Local Kokoro TTS Engine (`tts_engine.py`)
 
+> ⚡ **UPDATED** — Kokoro **v1.0** model files (`kokoro-v1.0.onnx` + `voices-v1.0.bin`), not the outdated v0.19. Uses `kokoro.create(text, voice=, speed=, lang=)` API. Adds async streaming via `kokoro.create_stream(...)`. All sync work wrapped in `asyncio.to_thread` so barge-in `task.cancel()` propagates within one event-loop tick.
+
 Fully local TTS — no cloud, no network latency, deterministic performance.
 
 ```python
 # tts_engine.py
+import asyncio
+import random
+from typing import AsyncIterator
 import numpy as np
 from kokoro_onnx import Kokoro
-from config import KOKORO_MODEL_PATH, KOKORO_VOICES_PATH, TTS_VOICE, TTS_SPEED
+from config import (
+    KOKORO_MODEL_PATH,
+    KOKORO_VOICES_PATH,
+    TTS_VOICE,
+    TTS_SPEED,
+    TTS_LANG,
+    TTS_STREAM,
+)
 
 
 class TTSEngine:
-    """Kokoro ONNX local text-to-speech engine."""
+    """Kokoro ONNX local text-to-speech engine.
+
+    Loaded ONCE at startup, shared across sessions (stateless synthesis).
+    """
 
     def __init__(self):
         self.kokoro = Kokoro(KOKORO_MODEL_PATH, KOKORO_VOICES_PATH)
         self.voice = TTS_VOICE
         self.speed = TTS_SPEED
-        self.sample_rate = 24000  # Kokoro outputs 24kHz audio
+        self.lang = TTS_LANG
+        self.sample_rate = 24000  # Kokoro always outputs 24kHz
 
-    def synthesize(self, text: str) -> tuple[bytes, int]:
-        """
-        Synthesize text to raw PCM int16 bytes.
-
-        Returns:
-            (pcm_bytes, sample_rate) — ready to send over WebSocket
-        """
+    def _synthesize_blocking(self, text: str) -> tuple[bytes, int]:
+        """Synchronous synthesis — call via asyncio.to_thread()."""
         if not text.strip():
             return b"", self.sample_rate
-
-        audio_float32, sr = self.kokoro.create(
-            text, voice=self.voice, speed=self.speed
+        samples, sr = self.kokoro.create(
+            text, voice=self.voice, speed=self.speed, lang=self.lang
         )
-
-        # Convert float32 [-1, 1] to int16 PCM bytes
-        audio_int16 = (audio_float32 * 32767).astype(np.int16)
+        audio_int16 = (np.asarray(samples) * 32767).astype(np.int16)
         return audio_int16.tobytes(), sr
 
-    def synthesize_filler(self) -> tuple[bytes, int]:
+    async def synthesize(self, text: str) -> tuple[bytes, int]:
+        """Synthesize text → raw PCM int16 bytes. Off-thread."""
+        return await asyncio.to_thread(self._synthesize_blocking, text)
+
+    async def synthesize_stream(self, text: str) -> AsyncIterator[tuple[bytes, int]]:
+        """
+        Stream synthesis in Kokoro's native chunks. Yields (pcm_bytes, sample_rate).
+
+        Note: kokoro.create_stream is itself an async generator wrapping blocking
+        work; we trust its internal scheduling. For finer preemption we could
+        re-wrap, but Kokoro chunks are short enough (~200ms) that barge-in
+        latency is acceptable.
+        """
+        if not text.strip():
+            return
+        async for samples, sr in self.kokoro.create_stream(
+            text, voice=self.voice, speed=self.speed, lang=self.lang
+        ):
+            audio_int16 = (np.asarray(samples) * 32767).astype(np.int16)
+            yield audio_int16.tobytes(), sr
+
+    async def synthesize_filler(self) -> tuple[bytes, int]:
         """Generate a short filler audio for tool execution delays."""
         fillers = [
             "Let me check on that.",
             "One moment.",
             "Looking that up for you.",
         ]
-        import random
-        return self.synthesize(random.choice(fillers))
+        return await self.synthesize(random.choice(fillers))
 ```
 
 **Why Kokoro over edge-tts:**
@@ -816,31 +990,73 @@ class TTSEngine:
 - ✅ Raw PCM output (no MP3 decode overhead)
 - ✅ Deterministic latency (no cloud variability)
 - ✅ Works offline
+- ✅ Native async streaming via `create_stream` for sub-sentence TTFA
 
 ---
 
-## 🧠 Phase 7: WebSocket Orchestrator & 4-Step Barge-in (`server.py`)
+## 🧠 Phase 7: WebSocket Orchestrator & 4-Step Barge-in (`server.py` + `engines.py`)
+
+> ⚡ **UPDATED** — many fixes vs. draft:
+> - **Shared singletons** via FastAPI `lifespan` (one VAD/ASR/LLM/TTS instance, all sessions).
+> - **All blocking calls in `asyncio.to_thread`** (VAD, ASR, TTS) — barge-in `task.cancel()` propagates within one event-loop tick.
+> - **Concurrent-pipeline guard**: cancel in-flight task before launching new.
+> - **Barge-in no longer discards the interrupting chunk**: seeds new `audio_buffer` with current chunk + pre-speech buffer.
+> - **State reconstruction** based on `words_spoken` only (sentences actually synthesized).
 
 This is the **heart of the POC** — tying all engines together with the barge-in interruption flow.
+
+```python
+# engines.py
+"""Shared singleton engine instances — loaded once at startup, shared across sessions."""
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from vad_engine import VADEngine  # noqa: F401 — per-session instances (stateful)
+from asr_engine import ASREngine
+from llm_engine import LLMEngine
+from tts_engine import TTSEngine
+
+# VAD is stateful per-session — instantiated per Session, not shared
+# ASR/LLM/TTS are stateless — shared across sessions
+
+asr_engine: ASREngine | None = None
+llm_engine: LLMEngine | None = None
+tts_engine: TTSEngine | None = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Load all stateless engines once at startup."""
+    global asr_engine, llm_engine, tts_engine
+    print("Loading ASR engine...")
+    asr_engine = ASREngine()
+    print("Loading LLM engine (no-op for client)...")
+    llm_engine = LLMEngine()
+    print("Loading TTS engine...")
+    tts_engine = TTSEngine()
+    print("All engines loaded.")
+    yield
+    # Cleanup
+    if llm_engine:
+        await llm_engine.close()
+```
 
 ```python
 # server.py
 import asyncio
 import logging
 import time
+from contextlib import suppress
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from vad_engine import VADEngine
-from asr_engine import ASREngine
-from llm_engine import LLMEngine
-from tts_engine import TTSEngine
-from config import HOST, PORT
+from engines import lifespan, asr_engine, llm_engine, tts_engine
+from config import HOST, PORT, LOG_LATENCY
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("voicetutor")
 
-app = FastAPI(title="Realtime Voice Tutor")
+app = FastAPI(title="Realtime Voice Tutor", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
@@ -851,17 +1067,24 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "asr_loaded": asr_engine is not None,
+        "llm_loaded": llm_engine is not None,
+        "tts_loaded": tts_engine is not None,
+    }
 
 
 class Session:
-    """Per-connection state — each browser tab gets its own session."""
+    """Per-connection state — each browser tab gets its own session.
+
+    Engines (ASR/LLM/TTS) are shared singletons. VAD is per-session because
+    it has internal LSTM state.
+    """
 
     def __init__(self):
-        self.vad = VADEngine()
-        self.asr = ASREngine()
-        self.llm = LLMEngine()
-        self.tts = TTSEngine()
+        self.vad = VADEngine()  # per-session (stateful)
+        # asr_engine, llm_engine, tts_engine are module-level singletons
 
         self.chat_history: list[dict] = []
         self.active_task: asyncio.Task | None = None
@@ -891,8 +1114,11 @@ async def voice_endpoint(ws: WebSocket):
             data = await ws.receive_bytes()
             turn_start = time.perf_counter()
 
-            vad_result = session.vad.process_chunk(
-                data, agent_is_speaking=session.is_agent_speaking
+            # VAD is sync CPU work — off-thread so we don't block other sessions
+            vad_result = await asyncio.to_thread(
+                session.vad.process_chunk,
+                data,
+                session.is_agent_speaking,
             )
 
             # ──────────────────────────────────────────────
@@ -907,6 +1133,8 @@ async def voice_endpoint(ws: WebSocket):
                 # Step 2: Cancel active LLM + TTS pipeline
                 if session.active_task and not session.active_task.done():
                     session.active_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await session.active_task
 
                 # Step 3: Halt agent speaking state
                 session.is_agent_speaking = False
@@ -924,7 +1152,11 @@ async def voice_endpoint(ws: WebSocket):
                 logger.info(f"State reconstructed: '{spoken_text[:80]}...'")
 
                 # Reset for new user turn
-                session.audio_buffer.clear()
+                # ⚡ FIX vs draft: do NOT discard the interrupting chunk.
+                # Seed new audio_buffer with current chunk + pre-speech buffer
+                # so the user's interrupting word is captured by ASR.
+                session.audio_buffer = bytearray(session.pre_speech_buffer)
+                session.audio_buffer.extend(data)
                 session.words_spoken.clear()
                 session.bytes_sent = 0
                 session.vad.reset()
@@ -938,10 +1170,12 @@ async def voice_endpoint(ws: WebSocket):
                 if len(session.audio_buffer) == 0 and len(session.pre_speech_buffer) > 0:
                     session.audio_buffer.extend(session.pre_speech_buffer)
                 session.audio_buffer.extend(data)
+                session.pre_speech_buffer.clear()
             else:
                 # Maintain rolling pre-speech buffer
                 session.pre_speech_buffer.extend(data)
                 if len(session.pre_speech_buffer) > session.PRE_SPEECH_BYTES:
+                    # Trim by slicing (bytearray slice assignment)
                     session.pre_speech_buffer = session.pre_speech_buffer[
                         -session.PRE_SPEECH_BYTES:
                     ]
@@ -950,7 +1184,16 @@ async def voice_endpoint(ws: WebSocket):
             # 3. TRANSCRIBE: Speech ended → ASR → LLM → TTS
             # ──────────────────────────────────────────────
             if vad_result["speech_ended"] and len(session.audio_buffer) > 0:
-                user_text = session.asr.transcribe(session.audio_buffer)
+                # ⚡ FIX vs draft: concurrent-pipeline guard
+                if session.active_task and not session.active_task.done():
+                    session.active_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await session.active_task
+
+                # ASR is sync CPU work — off-thread
+                user_text = await asyncio.to_thread(
+                    asr_engine.transcribe, bytes(session.audio_buffer)
+                )
                 session.audio_buffer.clear()
                 session.pre_speech_buffer.clear()
 
@@ -958,9 +1201,7 @@ async def voice_endpoint(ws: WebSocket):
                     continue
 
                 elapsed_asr = (time.perf_counter() - turn_start) * 1000
-                logger.info(
-                    f"📝 ASR ({elapsed_asr:.0f}ms): {user_text}"
-                )
+                logger.info(f"📝 ASR ({elapsed_asr:.0f}ms): {user_text}")
 
                 # Send transcript to UI
                 await ws.send_json(
@@ -977,11 +1218,16 @@ async def voice_endpoint(ws: WebSocket):
 
     except WebSocketDisconnect:
         logger.info("Client disconnected")
-        await session.llm.close()
+        if session.active_task and not session.active_task.done():
+            session.active_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await session.active_task
 
 
 async def run_response_pipeline(ws: WebSocket, session: Session):
     """Stream LLM tokens → sentence chunking → Kokoro TTS → WebSocket audio."""
+    turn_start = time.perf_counter()
+    pipeline_start = turn_start
     try:
         session.is_agent_speaking = True
         session.words_spoken.clear()
@@ -989,21 +1235,20 @@ async def run_response_pipeline(ws: WebSocket, session: Session):
 
         sentence_buffer = ""
         full_response = ""
-        turn_start = time.perf_counter()
         first_audio_sent = False
 
-        async for token in session.llm.generate_stream(session.chat_history):
+        async for token in llm_engine.generate_stream(session.chat_history):
             sentence_buffer += token
             full_response += token
 
             # Stream TTS per completed sentence for lowest TTFA
             if any(sentence_buffer.rstrip().endswith(p) for p in ".?!\n"):
                 sentence = sentence_buffer.strip()
+                sentence_buffer = ""
                 if not sentence:
-                    sentence_buffer = ""
                     continue
 
-                # Track words for state reconstruction
+                # Track words for state reconstruction (only what's synthesized)
                 session.words_spoken.extend(sentence.split())
 
                 # Send text transcript to UI
@@ -1011,12 +1256,11 @@ async def run_response_pipeline(ws: WebSocket, session: Session):
                     {"type": "TRANSCRIPT", "role": "assistant", "text": sentence}
                 )
 
-                # Synthesize and send audio
-                pcm_bytes, sample_rate = session.tts.synthesize(sentence)
+                # Synthesize sentence — off-thread
+                pcm_bytes, sample_rate = await tts_engine.synthesize(sentence)
                 if pcm_bytes:
-                    # Send sample rate metadata before first audio chunk
                     if not first_audio_sent:
-                        elapsed = (time.perf_counter() - turn_start) * 1000
+                        elapsed = (time.perf_counter() - pipeline_start) * 1000
                         logger.info(f"🔊 TTFA: {elapsed:.0f}ms")
                         await ws.send_json(
                             {"type": "AUDIO_START", "sample_rate": sample_rate}
@@ -1026,8 +1270,6 @@ async def run_response_pipeline(ws: WebSocket, session: Session):
                     await ws.send_bytes(pcm_bytes)
                     session.bytes_sent += len(pcm_bytes)
 
-                sentence_buffer = ""
-
         # Handle any remaining text that didn't end with punctuation
         if sentence_buffer.strip():
             sentence = sentence_buffer.strip()
@@ -1035,7 +1277,7 @@ async def run_response_pipeline(ws: WebSocket, session: Session):
             await ws.send_json(
                 {"type": "TRANSCRIPT", "role": "assistant", "text": sentence}
             )
-            pcm_bytes, sample_rate = session.tts.synthesize(sentence)
+            pcm_bytes, sample_rate = await tts_engine.synthesize(sentence)
             if pcm_bytes:
                 if not first_audio_sent:
                     await ws.send_json(
@@ -1052,12 +1294,19 @@ async def run_response_pipeline(ws: WebSocket, session: Session):
         )
         session.is_agent_speaking = False
 
-        total_ms = (time.perf_counter() - turn_start) * 1000
+        total_ms = (time.perf_counter() - pipeline_start) * 1000
         logger.info(f"✅ Turn complete: {total_ms:.0f}ms total")
 
     except asyncio.CancelledError:
         logger.info("🛑 Pipeline cancelled by barge-in")
         session.is_agent_speaking = False
+        # Append partial response so the reconstructed history (done by barge-in
+        # Step 4) reflects what was synthesized up to the cancellation point.
+        if full_response.strip():
+            session.chat_history.append(
+                {"role": "assistant", "content": full_response.strip()}
+            )
+        raise  # re-raise so the awaiting caller sees the cancellation
 
 
 if __name__ == "__main__":
@@ -1068,414 +1317,60 @@ if __name__ == "__main__":
 
 ---
 
-## 🎨 Phase 8: Browser UI (`static/index.html`)
+## 🎨 Phase 8: Browser UI (`static/index.html` + `static/worker.js` + `static/resample-processor.js`)
+
+> ⚡ **UPDATED** — replaced deprecated `ScriptProcessorNode` with **AudioWorklet** that captures at the native rate and resamples to 16kHz inside the worklet, emitting 512-sample Int16 chunks. Playback uses a single `AudioContext` at the native rate, with per-chunk upsampling 24kHz → native (browsers ignore non-standard `sampleRate` ctor arg).
 
 Dark-mode dashboard with proper sequential audio playback, real-time visualizer, and instant barge-in buffer flushing.
+
+**`static/resample-processor.js`** — AudioWorkletProcessor that:
+- Runs at the AudioContext native sample rate (commonly 48kHz)
+- Accumulates samples and linearly resamples to 16kHz
+- Outputs 512-sample Int16 PCM chunks via `port.postMessage()` to main thread
+- Main thread forwards the chunk over WebSocket
+
+**`static/worker.js`** — main-thread glue:
+- Sets up `audioContext = new AudioContext()` (native rate, AEC/NS/AGC on mic)
+- `audioContext.audioWorklet.addModule('resample-processor.js')`
+- Pipes mic stream → AudioWorkletNode → forwards Int16 chunks to WebSocket
+- Handles incoming PCM chunks, upsamples 24kHz→native, queues sequentially via `nextPlayTime`
+
+**`static/index.html`** — UI shell, dark theme (unchanged from draft).
 
 ```html
 <!DOCTYPE html>
 <html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Realtime Voice Tutor — English Practice</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-
-        body {
-            font-family: 'Inter', sans-serif;
-            background: #0a0e1a;
-            color: #e2e8f0;
-            min-height: 100vh;
-            display: flex;
-            justify-content: center;
-            padding: 24px;
-        }
-
-        .container {
-            width: 100%;
-            max-width: 720px;
-            display: flex;
-            flex-direction: column;
-            gap: 16px;
-        }
-
-        /* --- Header --- */
-        .header {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            padding: 20px 24px;
-            background: linear-gradient(135deg, #1a1f35, #1e2744);
-            border-radius: 16px;
-            border: 1px solid rgba(99, 102, 241, 0.15);
-        }
-
-        .header h1 {
-            font-size: 20px;
-            font-weight: 700;
-            background: linear-gradient(135deg, #818cf8, #6366f1);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-        }
-
-        .status-badge {
-            padding: 6px 14px;
-            border-radius: 20px;
-            font-size: 12px;
-            font-weight: 600;
-            background: rgba(71, 85, 105, 0.4);
-            color: #94a3b8;
-            transition: all 0.3s ease;
-        }
-
-        .status-badge.connected {
-            background: rgba(16, 185, 129, 0.15);
-            color: #34d399;
-            box-shadow: 0 0 12px rgba(16, 185, 129, 0.1);
-        }
-
-        .status-badge.speaking {
-            background: rgba(99, 102, 241, 0.15);
-            color: #818cf8;
-            animation: pulse 1.5s ease-in-out infinite;
-        }
-
-        @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.6; }
-        }
-
-        /* --- Chat --- */
-        .chat-box {
-            flex: 1;
-            min-height: 400px;
-            max-height: 60vh;
-            overflow-y: auto;
-            background: #0f1322;
-            border-radius: 16px;
-            border: 1px solid rgba(255, 255, 255, 0.05);
-            padding: 20px;
-            display: flex;
-            flex-direction: column;
-            gap: 12px;
-        }
-
-        .msg {
-            max-width: 80%;
-            padding: 10px 16px;
-            border-radius: 12px;
-            font-size: 14px;
-            line-height: 1.6;
-            animation: fadeIn 0.2s ease;
-        }
-
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(6px); }
-            to { opacity: 1; transform: translateY(0); }
-        }
-
-        .msg.user {
-            align-self: flex-end;
-            background: rgba(56, 189, 248, 0.1);
-            border: 1px solid rgba(56, 189, 248, 0.2);
-            color: #7dd3fc;
-        }
-
-        .msg.assistant {
-            align-self: flex-start;
-            background: rgba(74, 222, 128, 0.08);
-            border: 1px solid rgba(74, 222, 128, 0.15);
-            color: #86efac;
-        }
-
-        .msg.system {
-            align-self: center;
-            background: transparent;
-            color: #475569;
-            font-size: 12px;
-            font-style: italic;
-        }
-
-        /* --- Controls --- */
-        .controls {
-            display: flex;
-            gap: 12px;
-            align-items: center;
-        }
-
-        .btn {
-            flex: 1;
-            padding: 14px 24px;
-            border: none;
-            border-radius: 12px;
-            font-family: 'Inter', sans-serif;
-            font-size: 15px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: all 0.2s ease;
-        }
-
-        .btn-primary {
-            background: linear-gradient(135deg, #6366f1, #4f46e5);
-            color: white;
-            box-shadow: 0 4px 15px rgba(99, 102, 241, 0.3);
-        }
-
-        .btn-primary:hover {
-            transform: translateY(-1px);
-            box-shadow: 0 6px 20px rgba(99, 102, 241, 0.4);
-        }
-
-        .btn-primary.active {
-            background: linear-gradient(135deg, #ef4444, #dc2626);
-            box-shadow: 0 4px 15px rgba(239, 68, 68, 0.3);
-        }
-
-        /* --- Latency Display --- */
-        .latency {
-            text-align: center;
-            font-size: 11px;
-            color: #475569;
-        }
-
-        .latency span {
-            color: #6366f1;
-            font-weight: 600;
-        }
-
-        /* Scrollbar */
-        .chat-box::-webkit-scrollbar { width: 6px; }
-        .chat-box::-webkit-scrollbar-track { background: transparent; }
-        .chat-box::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 3px; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>🗣️ Voice Tutor</h1>
-            <div class="status-badge" id="status">Disconnected</div>
-        </div>
-
-        <div class="chat-box" id="chat">
-            <div class="msg system">Click "Start Talking" and say something to begin practicing!</div>
-        </div>
-
-        <div class="controls">
-            <button class="btn btn-primary" id="startBtn" onclick="toggleVoice()">
-                Start Talking
-            </button>
-        </div>
-        <div class="latency" id="latency"></div>
-    </div>
-
-    <script>
-        let ws = null;
-        let audioCtx = null;
-        let micStream = null;
-        let processor = null;
-
-        // --- Sequential Audio Queue ---
-        // Unlike v1 which created overlapping Audio() elements,
-        // this queues PCM buffers and plays them in sequence via AudioContext.
-        let audioQueue = [];
-        let isPlayingAudio = false;
-        let currentSource = null;
-        let ttsSampleRate = 24000;
-
-        async function toggleVoice() {
-            const btn = document.getElementById('startBtn');
-
-            if (ws) {
-                ws.close();
-                stopMic();
-                btn.textContent = 'Start Talking';
-                btn.classList.remove('active');
-                return;
-            }
-
-            ws = new WebSocket(`ws://${location.host}/ws/voice`);
-            ws.binaryType = 'arraybuffer';
-
-            ws.onopen = () => {
-                setStatus('connected', 'Connected & Listening');
-                btn.textContent = 'Stop';
-                btn.classList.add('active');
-                startMic();
-            };
-
-            ws.onmessage = (event) => {
-                if (typeof event.data === 'string') {
-                    const msg = JSON.parse(event.data);
-
-                    switch (msg.type) {
-                        case 'FLUSH':
-                            // Barge-in: immediately stop all audio
-                            flushAudio();
-                            break;
-
-                        case 'TRANSCRIPT':
-                            appendMessage(msg.role, msg.text);
-                            if (msg.role === 'assistant') {
-                                setStatus('speaking', 'Agent Speaking...');
-                            }
-                            break;
-
-                        case 'AUDIO_START':
-                            ttsSampleRate = msg.sample_rate || 24000;
-                            break;
-
-                        case 'END_OF_TURN':
-                            setStatus('connected', 'Connected & Listening');
-                            break;
-                    }
-                } else {
-                    // Binary = PCM audio chunk from Kokoro TTS
-                    queueAudio(event.data);
-                }
-            };
-
-            ws.onclose = () => {
-                setStatus('disconnected', 'Disconnected');
-                btn.textContent = 'Start Talking';
-                btn.classList.remove('active');
-                ws = null;
-                flushAudio();
-            };
-
-            ws.onerror = () => {
-                setStatus('disconnected', 'Connection Error');
-            };
-        }
-
-        // --- Microphone Capture ---
-        async function startMic() {
-            audioCtx = new AudioContext({ sampleRate: 16000 });
-
-            // Browser AEC: echoCancellation removes speaker feedback from mic input
-            // This prevents false barge-in triggers from agent's own TTS audio
-            micStream = await navigator.mediaDevices.getUserMedia({
-                audio: {
-                    echoCancellation: true,
-                    noiseSuppression: true,
-                    autoGainControl: true,
-                    sampleRate: 16000,
-                }
-            });
-
-            const source = audioCtx.createMediaStreamSource(micStream);
-
-            // ScriptProcessor sends 512-sample chunks matching Silero VAD input size
-            // Note: ScriptProcessor is deprecated; AudioWorkletNode is preferred for production
-            processor = audioCtx.createScriptProcessor(512, 1, 1);
-            processor.onaudioprocess = (e) => {
-                if (!ws || ws.readyState !== WebSocket.OPEN) return;
-                const float32 = e.inputBuffer.getChannelData(0);
-                const int16 = new Int16Array(float32.length);
-                for (let i = 0; i < float32.length; i++) {
-                    int16[i] = Math.max(-1, Math.min(1, float32[i])) * 0x7FFF;
-                }
-                ws.send(int16.buffer);
-            };
-
-            source.connect(processor);
-            processor.connect(audioCtx.destination);
-        }
-
-        function stopMic() {
-            if (processor) { processor.disconnect(); processor = null; }
-            if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
-            if (audioCtx) { audioCtx.close(); audioCtx = null; }
-        }
-
-        // --- Sequential Audio Playback ---
-        // Queues PCM int16 buffers and plays them back-to-back through AudioContext
-        // without overlap or gaps.
-
-        let playbackCtx = null;
-        let nextPlayTime = 0;
-
-        function queueAudio(arrayBuffer) {
-            if (!playbackCtx) {
-                playbackCtx = new AudioContext({ sampleRate: ttsSampleRate });
-                nextPlayTime = playbackCtx.currentTime;
-            }
-
-            const int16 = new Int16Array(arrayBuffer);
-            const float32 = new Float32Array(int16.length);
-            for (let i = 0; i < int16.length; i++) {
-                float32[i] = int16[i] / 32768.0;
-            }
-
-            const buffer = playbackCtx.createBuffer(1, float32.length, ttsSampleRate);
-            buffer.getChannelData(0).set(float32);
-
-            const source = playbackCtx.createBufferSource();
-            source.buffer = buffer;
-            source.connect(playbackCtx.destination);
-
-            // Schedule seamlessly after previous chunk
-            const startTime = Math.max(nextPlayTime, playbackCtx.currentTime);
-            source.start(startTime);
-            nextPlayTime = startTime + buffer.duration;
-
-            // Track for flush
-            audioQueue.push(source);
-            source.onended = () => {
-                const idx = audioQueue.indexOf(source);
-                if (idx > -1) audioQueue.splice(idx, 1);
-            };
-        }
-
-        function flushAudio() {
-            console.log('⚡ FLUSH — stopping all audio');
-            // Stop all scheduled and playing audio sources
-            audioQueue.forEach(source => {
-                try { source.stop(); } catch(e) {}
-            });
-            audioQueue = [];
-            nextPlayTime = 0;
-
-            // Reset playback context to clear any scheduled buffers
-            if (playbackCtx) {
-                playbackCtx.close();
-                playbackCtx = null;
-            }
-        }
-
-        // --- UI Helpers ---
-        function setStatus(state, text) {
-            const el = document.getElementById('status');
-            el.textContent = text;
-            el.className = 'status-badge ' + state;
-        }
-
-        function appendMessage(role, text) {
-            const chat = document.getElementById('chat');
-            const div = document.createElement('div');
-            div.className = `msg ${role}`;
-            div.textContent = text;
-            chat.appendChild(div);
-            chat.scrollTop = chat.scrollHeight;
-        }
-    </script>
-</body>
+<!-- ... dark-mode UI shell identical to draft ... -->
+<script>
+// See static/worker.js for full implementation. Key entry points:
+//   - toggleVoice(): opens WebSocket, requests mic, adds AudioWorklet module
+//   - handleMicChunk(int16ArrayBuffer): forwards to ws.send()
+//   - queueAudio(pcm24kHz): upsamples to native rate, schedules via AudioContext
+//   - flushAudio(): stops all sources, recreates AudioContext for clean state
+</script>
 </html>
 ```
+
+See the actual implementation in `static/` — the snippet is omitted here for brevity.
 
 
 ---
 
 ## 🚀 Phase 9: Run & Test
 
-### 1. Download Kokoro Model Files
+### 1. Download Model Files
+
+> ⚡ **UPDATED** — uses `scripts/download_models.py` to fetch **Kokoro v1.0** and **Silero VAD** ONNX files into `models/`. Old draft referenced the outdated Kokoro v0.19 + `huggingface-cli`.
 
 ```bash
-# Download ONNX model and voice pack (one-time setup)
-pip install huggingface-hub
-huggingface-cli download hexgrad/Kokoro-82M --include 'kokoro-v0_19.onnx' 'voices.bin' --local-dir .
+# One-time model download into models/
+uv run python scripts/download_models.py
 ```
+
+`scripts/download_models.py` fetches:
+- `models/kokoro-v1.0.onnx` — from `github.com/thewh1teagle/kokoro-onnx/releases/tag/model-files-v1.0`
+- `models/voices-v1.0.bin` — same release
+- `models/silero_vad.onnx` — from `github.com/snakers4/silero-vad/releases/latest`
 
 ### 2. Start Ollama
 
@@ -1487,8 +1382,9 @@ ollama serve
 ### 3. Launch the Server
 
 ```bash
+# Copy template and edit if needed (NEVER overwrite existing .env)
 cp .env.example .env
-python server.py
+uv run python server.py
 ```
 
 ### 4. Test in Browser
@@ -1512,6 +1408,12 @@ python server.py
 | Barge-in | Interrupt mid-sentence | Audio stops, state reconstructed |
 | Short utterance | "Yes" or "OK" | Transcribed despite < 1 sec duration |
 | Natural flow | Free conversation | Agent corrects grammar gently |
+
+### 6. Run Tests
+
+```bash
+uv run pytest tests/ -v
+```
 
 ---
 
