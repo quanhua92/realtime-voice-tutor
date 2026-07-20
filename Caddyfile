@@ -1,0 +1,30 @@
+# Caddyfile for local HTTPS using mkcert-issued certificates.
+# Certs at static/tls-{cert,key}.pem include SANs for:
+#   localhost, 127.0.0.1, ::1, 192.168.1.18
+#
+# Trust the CA once (needs sudo password):
+#   mkcert -install
+#
+# Then Chrome accepts these certs silently.
+
+{
+    # Disable HTTP/3 (QUIC over UDP). Chrome caches the Alt-Svc header
+    # and keeps retrying QUIC, which fails on LAN — causing
+    # ERR_SSL_PROTOCOL_ERROR. Stick to HTTP/1.1 + HTTP/2 over TCP.
+    servers {
+        protocols h1 h2
+    }
+}
+
+https://:8443 {
+	tls static/tls-cert.pem static/tls-key.pem
+
+	reverse_proxy 127.0.0.1:8888 {
+		# Stream without buffering — critical for low-latency WebSocket audio
+		flush_interval -1
+	}
+
+	header {
+		Access-Control-Allow-Origin "*"
+	}
+}

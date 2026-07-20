@@ -44,3 +44,4 @@ htmlcov/
 .coverage
 .coverage.*
 coverage.xml
+static/tls-*.pem
