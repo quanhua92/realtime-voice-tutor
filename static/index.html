@@ -229,32 +229,6 @@
             font-weight: 600;
         }
 
-        .device-row {
-            display: flex;
-            gap: 8px;
-            align-items: center;
-            font-size: 12px;
-            color: #94a3b8;
-            padding: 0 4px;
-        }
-
-        .device-row select {
-            flex: 1;
-            background: #1e2744;
-            color: #e2e8f0;
-            border: 1px solid rgba(99, 102, 241, 0.3);
-            border-radius: 8px;
-            padding: 8px 10px;
-            font-family: inherit;
-            font-size: 13px;
-            cursor: pointer;
-        }
-
-        .device-row select:focus {
-            outline: none;
-            border-color: rgba(99, 102, 241, 0.6);
-        }
-
         .chat-box::-webkit-scrollbar { width: 6px; }
         .chat-box::-webkit-scrollbar-track { background: transparent; }
         .chat-box::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 3px; }
@@ -269,17 +243,6 @@
 
         <div class="chat-box" id="chat">
             <div class="msg system">Click "Start Talking" and say something to begin practicing!</div>
-        </div>
-
-        <div class="device-row" id="deviceRow" style="display:none;">
-            <label style="display:flex;align-items:center;gap:4px;cursor:pointer;">
-                <input type="checkbox" id="aecToggle" checked onchange="changeAec()" style="cursor:pointer;">
-                <span>AEC</span>
-            </label>
-            <span>🔊</span>
-            <select id="outputPicker" onchange="changeOutput()">
-                <option value="">System default</option>
-            </select>
         </div>
 
         <div class="controls">
@@ -483,16 +446,16 @@
             // This is the first line of defense against false barge-in.
             // SIDE EFFECT: Chrome tags the page as "communications" mode and
             // routes ALL audio through the system's comms device (call speaker,
-            // Bluetooth headset call channel). We let the user pick a media
-            // output device via setSinkId to override this — and system AEC
-            // follows the new output, so we keep echo cancellation benefits.
-            const aecOn = document.getElementById('aecToggle').checked;
-            console.log(`[mic] requesting getUserMedia with AEC=${aecOn}`);
+            // AEC: echoCancellation removes speaker feedback from mic input.
+            // This is the first line of defense against false barge-in.
+            // Hardcoded on — AEC works well in our setup and removing the
+            // toggle simplifies the UI.
+            console.log('[mic] requesting getUserMedia with AEC=true');
             micStream = await navigator.mediaDevices.getUserMedia({
                 audio: {
-                    echoCancellation: aecOn,
-                    noiseSuppression: aecOn,
-                    autoGainControl: aecOn,
+                    echoCancellation: true,
+                    noiseSuppression: true,
+                    autoGainControl: true,
                 }
             });
 
@@ -510,15 +473,10 @@
                 channelCount: settings.channelCount,
                 label: track.label,
             });
-            if (settings.echoCancellation !== aecOn) {
-                console.warn(`[mic] WARNING: requested AEC=${aecOn} but browser gave us AEC=${settings.echoCancellation}`);
+            if (settings.echoCancellation !== true) {
+                console.warn(`[mic] WARNING: requested AEC=true but browser gave us AEC=${settings.echoCancellation}`);
                 appendMessage('system', `⚠️ Browser ignored AEC request — got echoCancellation=${settings.echoCancellation}`);
             }
-
-            // Populate the output device picker.
-            // Chrome hides device labels until mic permission is granted,
-            // so we can only meaningfully populate this AFTER getUserMedia.
-            await refreshOutputDevices();
 
             // Load the worklet that downsamples native→16kHz
             await micCtx.audioWorklet.addModule('/static/resample-processor.js');
@@ -557,136 +515,6 @@
         // We use a single AudioContext at native rate. Each incoming 24kHz
         // chunk is wrapped in an AudioBuffer (which performs the resample to
         // native rate during scheduling) and queued back-to-back.
-        async function refreshOutputDevices() {
-            const sel = document.getElementById('outputPicker');
-            const row = document.getElementById('deviceRow');
-            if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
-                return; // browser too old — picker stays hidden
-            }
-            const devices = await navigator.mediaDevices.enumerateDevices();
-            const outputs = devices.filter(d => d.kind === 'audiooutput');
-            if (outputs.length === 0) return;
-
-            // Preserve current selection
-            const prevValue = sel.value;
-            sel.innerHTML = '';
-
-            // First option: empty-string sinkId = system default (per spec)
-            const defaultOpt = document.createElement('option');
-            defaultOpt.value = '';
-            defaultOpt.textContent = 'System default';
-            sel.appendChild(defaultOpt);
-
-            // List all real output devices with their labels.
-            // Skip Chrome's own "Default - <device>" entry — it duplicates our
-            // manual "System default" option (Chrome adds one per default device
-            // group, which on macOS produces duplicate "Default" entries).
-            for (const d of outputs) {
-                let label = d.label || `Device ${d.deviceId.slice(0, 8)}`;
-                // Skip if this is Chrome's "Default - ..." pseudo-entry
-                if (/^Default\s*[-–]/i.test(label)) continue;
-                // Strip "Default - " prefix if somehow still there
-                label = label.replace(/^Default\s*[-–]\s*/i, '');
-
-                const opt = document.createElement('option');
-                opt.value = d.deviceId;
-                opt.textContent = label;
-                sel.appendChild(opt);
-            }
-
-            // If the user previously picked something, keep it
-            if (prevValue && Array.from(sel.options).some(o => o.value === prevValue)) {
-                sel.value = prevValue;
-            }
-
-            // Show the picker
-            row.style.display = 'flex';
-        }
-
-        async function changeOutput() {
-            const sel = document.getElementById('outputPicker');
-            chosenSinkId = sel.value;
-
-            // If playback already started, recreate the AudioContext with the
-            // new sinkId. Merely calling setSinkId on an existing context also
-            // works (Chrome 110+) but recreating is more reliable across
-            // browser versions and avoids race conditions with scheduled
-            // buffers.
-            if (playbackCtx) {
-                scheduledSources.forEach(s => { try { s.stop(); } catch (e) {} });
-                scheduledSources = [];
-                nextPlayTime = 0;
-                try { playbackCtx.close(); } catch (e) {}
-                playbackCtx = null;
-            }
-            console.log(`Output device → ${chosenSinkId === '' ? 'system default' : chosenSinkId}`);
-        }
-
-        async function changeAec() {
-            // Toggling AEC requires re-acquiring the mic stream with new constraints.
-            // This MUST happen after a user gesture (the toggle click qualifies).
-            const aecOn = document.getElementById('aecToggle').checked;
-            console.log(`[aec] toggle clicked → aecOn=${aecOn}`);
-            if (!micStream) {
-                console.log('[aec] mic not started yet, ignoring');
-                return;
-            }
-
-            // Stop existing tracks and worklet
-            if (workletNode) { try { workletNode.disconnect(); } catch(e) {} workletNode = null; }
-            if (micStream) {
-                micStream.getTracks().forEach(t => t.stop());
-                micStream = null;
-            }
-
-            // Re-acquire mic with the new AEC setting
-            try {
-                console.log(`[aec] re-acquiring mic with AEC=${aecOn}`);
-                micStream = await navigator.mediaDevices.getUserMedia({
-                    audio: {
-                        echoCancellation: aecOn,
-                        noiseSuppression: aecOn,    // tie NS to AEC for simplicity
-                        autoGainControl: aecOn,
-                    }
-                });
-            } catch (e) {
-                appendMessage('system', `⚠️ Mic restart failed: ${e.message}`);
-                // Re-check the box since we couldn't actually change it
-                document.getElementById('aecToggle').checked = !aecOn;
-                return;
-            }
-
-            // Verify the browser actually honored the AEC change
-            const track = micStream.getAudioTracks()[0];
-            const settings = track.getSettings();
-            console.log('[aec] new actual settings:', {
-                echoCancellation: settings.echoCancellation,
-                noiseSuppression: settings.noiseSuppression,
-                autoGainControl: settings.autoGainControl,
-            });
-            if (settings.echoCancellation !== aecOn) {
-                console.warn(`[aec] browser ignored request — wanted AEC=${aecOn}, got AEC=${settings.echoCancellation}`);
-                appendMessage('system', `⚠️ Browser ignored AEC toggle — wanted ${aecOn}, got ${settings.echoCancellation}`);
-            }
-
-            // Rewire worklet → mute → destination
-            const source = micCtx.createMediaStreamSource(micStream);
-            workletNode = new AudioWorkletNode(micCtx, 'resample-processor');
-            workletNode.port.onmessage = (event) => {
-                if (ws && ws.readyState === WebSocket.OPEN) ws.send(event.data);
-            };
-            source.connect(workletNode);
-            const muteGain = micCtx.createGain();
-            muteGain.gain.value = 0;
-            workletNode.connect(muteGain);
-            muteGain.connect(micCtx.destination);
-
-            console.log(`AEC → ${aecOn ? 'ON (echo cancelled, may route to call speaker)' : 'OFF (media speaker, rely on server VAD threshold for echo rejection)'}`);
-            appendMessage('system', aecOn
-                ? '🎙️ AEC on — browser cancels speaker echo (may route audio to call channel).'
-                : '📢 AEC off — audio routes to media speaker. Server-side VAD threshold (0.92) still rejects echo during agent speech.');
-        }
-
         function queueAudio(arrayBuffer) {
             // Defense-in-depth: drop chunks arriving within 250ms of a FLUSH.
             // These are in-flight chunks the server sent just before/during
