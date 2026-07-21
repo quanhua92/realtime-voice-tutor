@@ -120,11 +120,19 @@ class TTSEngine:
         if not clean:
             return b"", self.SAMPLE_RATE
 
-        samples, sr = self.kokoro.create(
-            clean, voice=self.voice, speed=self.speed, lang=self.lang
-        )
-        audio_int16 = (np.asarray(samples) * 32767).astype(np.int16)
-        return audio_int16.tobytes(), sr
+        try:
+            samples, sr = self.kokoro.create(
+                clean, voice=self.voice, speed=self.speed, lang=self.lang
+            )
+            audio_int16 = (np.asarray(samples) * 32767).astype(np.int16)
+            return audio_int16.tobytes(), sr
+        except (ValueError, RuntimeError) as e:
+            # Kokoro can crash on input that passes our sanitizer but
+            # still can't be phonemized (e.g., just numbers, symbols,
+            # or fragmented text). Log and return silence rather than
+            # killing the pipeline.
+            logger.warning(f"TTS synthesis failed for {clean!r}: {e}")
+            return b"", self.SAMPLE_RATE
 
     async def synthesize(self, text: str) -> tuple[bytes, int]:
         """Synthesize text → raw int16 PCM bytes.
