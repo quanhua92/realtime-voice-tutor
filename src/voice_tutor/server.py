@@ -350,21 +350,19 @@ async def run_response_pipeline(ws: WebSocket, session: Session):
             ev_type = event.get("type")
 
             if ev_type == "thinking":
-                # Accumulate reasoning tokens; flush on sentence boundary
-                # so the UI gets one collapsible block per thoughts unit.
+                # Accumulate ALL thinking without flushing on punctuation.
+                # We'll flush as a single block when:
+                #   (a) a tool_call event arrives (so the user sees the
+                #       reasoning that led to invoking the tool), or
+                #   (b) the first content token arrives (so the user sees
+                #       the reasoning that led to the final response).
+                # This avoids the spam-of-tiny-blocks UX bug where every
+                # sentence in the thinking produced a new collapsible.
                 thinking_buffer += event.get("text", "")
-                # Flush thinking on . or ? or ! or newline
-                if thinking_buffer and any(thinking_buffer.rstrip().endswith(p) for p in ".?!\n"):
-                    if not epoch_changed():
-                        await ws.send_json({
-                            "type": "THINKING",
-                            "text": thinking_buffer.strip(),
-                        })
-                    thinking_buffer = ""
                 continue
 
             if ev_type == "tool_call":
-                # Flush any pending thinking first
+                # Flush any pending thinking as ONE block before the tool call
                 if thinking_buffer.strip() and not epoch_changed():
                     await ws.send_json({
                         "type": "THINKING",
@@ -392,7 +390,17 @@ async def run_response_pipeline(ws: WebSocket, session: Session):
                     })
                 continue
 
-            # Default: content
+            # Default: content — flush accumulated thinking as a single
+            # block on FIRST content token so the user sees the reasoning
+            # that preceded the response. Subsequent content tokens just
+            # extend sentence_buffer.
+            if thinking_buffer.strip() and not epoch_changed():
+                await ws.send_json({
+                    "type": "THINKING",
+                    "text": thinking_buffer.strip(),
+                })
+                thinking_buffer = ""
+
             token = event.get("text", "")
             sentence_buffer += token
             full_response += token

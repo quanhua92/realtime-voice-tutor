@@ -312,6 +312,7 @@
         let chosenSinkId = '';   // '' = system default; set by dropdown
         let lastFlushTime = 0;  // ms timestamp of last FLUSH; used to drop in-flight chunks
         let endOfTurnReceived = false;  // true after server says turn is done; cleared when queue drains
+        let lastThinkingDetails = null;  // tracks last <details> thinking block for merging
 
         // ────────────────────────────────────────────────────────────
         // Connect / disconnect
@@ -386,15 +387,25 @@
                     break;
                 case 'THINKING':
                     console.log(`[ws] ← THINKING (${msg.text.length} chars)`);
-                    appendMeta('thinking', '💭 Thinking', msg.text);
+                    appendMeta('thinking', `💭 Thinking (${msg.text.length} chars)`, msg.text, { autoOpen: false });
                     break;
                 case 'TOOL_CALL':
                     console.log(`[ws] ← TOOL_CALL ${msg.name}(${JSON.stringify(msg.arguments)})`);
-                    appendMeta('tool-call', `🛠️ Tool: ${msg.name}`, JSON.stringify(msg.arguments, null, 2));
+                    {
+                        const argStr = JSON.stringify(msg.arguments, null, 2);
+                        appendMeta('tool-call', `🛠️ ${msg.name}(${argStr.length > 40 ? argStr.slice(0, 40) + '…' : argStr})`, argStr, { autoOpen: false });
+                    }
                     break;
                 case 'TOOL_RESULT':
                     console.log(`[ws] ← TOOL_RESULT ${msg.name} (${msg.result.length} chars)`);
-                    appendMeta('tool-result', `✅ Result: ${msg.name}`, msg.result);
+                    {
+                        // Show first 80 chars of result as preview in the label,
+                        // full content in the body
+                        const preview = msg.result.length > 80
+                            ? msg.result.slice(0, 80) + '…'
+                            : msg.result;
+                        appendMeta('tool-result', `✅ ${msg.name}: ${preview}`, msg.result, { autoOpen: false });
+                    }
                     break;
                 case 'AUDIO_START':
                     console.log(`[ws] ← AUDIO_START sample_rate=${msg.sample_rate}`);
@@ -417,14 +428,37 @@
             }
         }
 
-        function appendMeta(kind, label, body) {
+        function appendMeta(kind, label, body, opts) {
             const chat = document.getElementById('chat');
+
+            // Merge consecutive thinking blocks: if the previous meta block
+            // was also thinking, append to its body instead of creating a
+            // new <details>. This keeps the UI clean even if the server
+            // flushes thinking in multiple chunks (e.g. once per LLM round
+            // when there's no tool call in between, or if the server-side
+            // flush logic changes later).
+            if (kind === 'thinking' && lastThinkingDetails) {
+                const bodyDiv = lastThinkingDetails.querySelector('.meta-body');
+                bodyDiv.textContent += '\n' + body;
+                const newLen = bodyDiv.textContent.length;
+                const summary = lastThinkingDetails.querySelector('summary');
+                summary.textContent = `💭 Thinking (${newLen} chars)`;
+                chat.scrollTop = chat.scrollHeight;
+                return;
+            }
+
             const details = document.createElement('details');
             details.className = `msg meta ${kind}`;
-            // Auto-collapse: only auto-open if the body is short
-            if (body && body.length < 80) details.open = true;
+            // All meta blocks start collapsed by default — they're verbose
+            // internal details, not the main conversation. User can expand
+            // any block by clicking it.
+            details.open = false;
             const summary = document.createElement('summary');
             summary.textContent = label;
+            summary.style.overflow = 'hidden';
+            summary.style.textOverflow = 'ellipsis';
+            summary.style.whiteSpace = 'nowrap';
+            summary.title = label;  // full text on hover
             const bodyDiv = document.createElement('div');
             bodyDiv.className = 'meta-body';
             bodyDiv.textContent = body;
@@ -432,6 +466,10 @@
             details.appendChild(bodyDiv);
             chat.appendChild(details);
             chat.scrollTop = chat.scrollHeight;
+
+            // Track thinking reference for merging; any other kind breaks
+            // the chain (so thinking before a tool call ≠ thinking after).
+            lastThinkingDetails = (kind === 'thinking') ? details : null;
         }
 
         // ────────────────────────────────────────────────────────────
@@ -760,6 +798,8 @@
             }
             chat.appendChild(div);
             chat.scrollTop = chat.scrollHeight;
+            // Any non-meta message breaks the thinking-merge chain
+            lastThinkingDetails = null;
         }
 
         function renderMarkdown(text) {
