@@ -128,6 +128,54 @@
         }
         .msg.assistant li { margin: 2px 0; }
 
+        /* --- Collapsible Thinking + Tool sections --- */
+        .msg.meta {
+            align-self: flex-start;
+            background: rgba(30, 41, 59, 0.4);
+            border-left: 2px solid rgba(148, 163, 184, 0.4);
+            color: #94a3b8;
+            font-size: 12px;
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            padding: 6px 10px;
+            border-radius: 6px;
+            max-width: 90%;
+            margin-top: -6px;   /* tuck under the assistant message it relates to */
+            margin-bottom: 4px;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+        .msg.meta > summary {
+            cursor: pointer;
+            font-weight: 600;
+            color: #64748b;
+            user-select: none;
+            list-style: none;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .msg.meta > summary::before {
+            content: "▸";
+            font-size: 10px;
+            transition: transform 0.15s ease;
+        }
+        .msg.meta[open] > summary::before {
+            transform: rotate(90deg);
+        }
+        .msg.meta > summary::-webkit-details-marker { display: none; }
+        .msg.meta .meta-body {
+            margin-top: 6px;
+            padding-top: 6px;
+            border-top: 1px dashed rgba(148, 163, 184, 0.2);
+            color: #cbd5e1;
+            line-height: 1.5;
+        }
+        .msg.meta.tool-call > summary { color: #a78bfa; }
+        .msg.meta.tool-call { border-left-color: rgba(167, 139, 250, 0.5); }
+        .msg.meta.tool-result > summary { color: #fbbf24; }
+        .msg.meta.tool-result { border-left-color: rgba(251, 191, 36, 0.5); }
+        .msg.meta.thinking > summary { color: #64748b; }
+
         .msg.system {
             align-self: center;
             background: transparent;
@@ -336,6 +384,18 @@
                         setStatus('speaking', 'Agent Speaking...');
                     }
                     break;
+                case 'THINKING':
+                    console.log(`[ws] ← THINKING (${msg.text.length} chars)`);
+                    appendMeta('thinking', '💭 Thinking', msg.text);
+                    break;
+                case 'TOOL_CALL':
+                    console.log(`[ws] ← TOOL_CALL ${msg.name}(${JSON.stringify(msg.arguments)})`);
+                    appendMeta('tool-call', `🛠️ Tool: ${msg.name}`, JSON.stringify(msg.arguments, null, 2));
+                    break;
+                case 'TOOL_RESULT':
+                    console.log(`[ws] ← TOOL_RESULT ${msg.name} (${msg.result.length} chars)`);
+                    appendMeta('tool-result', `✅ Result: ${msg.name}`, msg.result);
+                    break;
                 case 'AUDIO_START':
                     console.log(`[ws] ← AUDIO_START sample_rate=${msg.sample_rate}`);
                     ttsSampleRate = msg.sample_rate || 24000;
@@ -343,9 +403,6 @@
                 case 'END_OF_TURN':
                     console.log('[ws] ← END_OF_TURN');
                     endOfTurnReceived = true;
-                    // If playback queue is already empty (e.g., very short
-                    // response), send AUDIO_DONE immediately so the server
-                    // doesn't keep is_agent_speaking=True indefinitely.
                     if (scheduledSources.length === 0 && ws && ws.readyState === WebSocket.OPEN) {
                         console.log('[ws] → AUDIO_DONE (queue empty at END_OF_TURN)');
                         ws.send(JSON.stringify({ type: 'AUDIO_DONE' }));
@@ -358,6 +415,23 @@
                     appendMessage('system', `⚠️ ${msg.message}`);
                     break;
             }
+        }
+
+        function appendMeta(kind, label, body) {
+            const chat = document.getElementById('chat');
+            const details = document.createElement('details');
+            details.className = `msg meta ${kind}`;
+            // Auto-collapse: only auto-open if the body is short
+            if (body && body.length < 80) details.open = true;
+            const summary = document.createElement('summary');
+            summary.textContent = label;
+            const bodyDiv = document.createElement('div');
+            bodyDiv.className = 'meta-body';
+            bodyDiv.textContent = body;
+            details.appendChild(summary);
+            details.appendChild(bodyDiv);
+            chat.appendChild(details);
+            chat.scrollTop = chat.scrollHeight;
         }
 
         // ────────────────────────────────────────────────────────────

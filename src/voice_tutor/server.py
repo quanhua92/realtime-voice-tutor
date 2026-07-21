@@ -329,6 +329,7 @@ async def run_response_pipeline(ws: WebSocket, session: Session):
     my_epoch = session.barge_in_epoch
     full_response = ""
     sentence_buffer = ""
+    thinking_buffer = ""
     first_audio_sent = False
 
     def epoch_changed() -> bool:
@@ -340,12 +341,59 @@ async def run_response_pipeline(ws: WebSocket, session: Session):
         session.words_spoken.clear()
         session.bytes_sent = 0
 
-        async for token in engines.llm_engine.generate_stream(session.chat_history):
-            # Check epoch BEFORE consuming more tokens
+        async for event in engines.llm_engine.generate_stream(session.chat_history):
+            # Check epoch BEFORE consuming more events
             if epoch_changed():
                 logger.info("🛑 Pipeline epoch mismatch (LLM stream), aborting")
                 return
 
+            ev_type = event.get("type")
+
+            if ev_type == "thinking":
+                # Accumulate reasoning tokens; flush on sentence boundary
+                # so the UI gets one collapsible block per thoughts unit.
+                thinking_buffer += event.get("text", "")
+                # Flush thinking on . or ? or ! or newline
+                if thinking_buffer and any(thinking_buffer.rstrip().endswith(p) for p in ".?!\n"):
+                    if not epoch_changed():
+                        await ws.send_json({
+                            "type": "THINKING",
+                            "text": thinking_buffer.strip(),
+                        })
+                    thinking_buffer = ""
+                continue
+
+            if ev_type == "tool_call":
+                # Flush any pending thinking first
+                if thinking_buffer.strip() and not epoch_changed():
+                    await ws.send_json({
+                        "type": "THINKING",
+                        "text": thinking_buffer.strip(),
+                    })
+                    thinking_buffer = ""
+                # Tell the client a tool is being invoked (collapsible UI)
+                if not epoch_changed():
+                    await ws.send_json({
+                        "type": "TOOL_CALL",
+                        "id": event.get("id", ""),
+                        "name": event.get("name", ""),
+                        "arguments": event.get("arguments", {}),
+                    })
+                continue
+
+            if ev_type == "tool_result":
+                # Tell the client the tool result (collapsible UI)
+                if not epoch_changed():
+                    await ws.send_json({
+                        "type": "TOOL_RESULT",
+                        "id": event.get("id", ""),
+                        "name": event.get("name", ""),
+                        "result": event.get("result", ""),
+                    })
+                continue
+
+            # Default: content
+            token = event.get("text", "")
             sentence_buffer += token
             full_response += token
 
@@ -391,6 +439,13 @@ async def run_response_pipeline(ws: WebSocket, session: Session):
 
                 await ws.send_bytes(pcm_bytes)
                 session.bytes_sent += len(pcm_bytes)
+
+        # Flush any remaining thinking
+        if thinking_buffer.strip() and not epoch_changed():
+            await ws.send_json({
+                "type": "THINKING",
+                "text": thinking_buffer.strip(),
+            })
 
         # Flush any remaining text without punctuation
         if sentence_buffer.strip() and not epoch_changed():

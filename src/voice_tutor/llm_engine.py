@@ -83,14 +83,17 @@ class LLMEngine:
     async def generate_stream(
         self,
         messages: list[dict],
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[dict]:
         """Stream LLM response tokens; handle tool calls automatically.
 
         Prepends SYSTEM_PROMPT, trims to the last LLM_HISTORY_TURNS messages,
         and loops up to LLM_MAX_TOOL_ROUNDS times if the model invokes tools.
 
-        Yields:
-            Text tokens (str) as they arrive.
+        Yields dicts with one of these shapes:
+            {"type": "content",     "text": "..."}      # streamed text token
+            {"type": "thinking",    "text": "..."}      # streamed reasoning token
+            {"type": "tool_call",   "id": "...", "name": "...", "arguments": {...}}
+            {"type": "tool_result", "id": "...", "name": "...", "result": "..."}
         """
         full_messages: list[dict[str, Any]] = [
             {"role": "system", "content": SYSTEM_PROMPT}
@@ -112,8 +115,17 @@ class LLMEngine:
                 if not chunk.choices:
                     continue
                 delta = chunk.choices[0].delta
+                # Reasoning tokens — field name varies by provider:
+                #   Ollama OpenAI-compat → delta.reasoning
+                #   OpenAI native o1/o3 → delta.reasoning_content
+                # Use getattr with default because Pydantic raises
+                # AttributeError for unknown fields (not None).
+                rc = getattr(delta, "reasoning_content", None)
+                r = getattr(delta, "reasoning", None)
+                if rc or r:
+                    yield {"type": "thinking", "text": rc or r}
                 if delta.content:
-                    yield delta.content
+                    yield {"type": "content", "text": delta.content}
             return
 
         for round_idx in range(LLM_MAX_TOOL_ROUNDS):
@@ -135,10 +147,18 @@ class LLMEngine:
                     continue
                 delta = chunk.choices[0].delta
 
+                # Stream reasoning tokens (qwen3 etc.) — shown in collapsible UI
+                # Use getattr because Pydantic raises AttributeError for
+                # unknown fields like 'reasoning_content' on non-OpenAI models.
+                rc = getattr(delta, "reasoning_content", None)
+                r = getattr(delta, "reasoning", None)
+                if rc or r:
+                    yield {"type": "thinking", "text": rc or r}
+
                 # Stream text tokens to caller as they arrive
                 if delta.content:
                     accumulated_text += delta.content
-                    yield delta.content
+                    yield {"type": "content", "text": delta.content}
 
                 # Accumulate tool_calls across chunks
                 if delta.tool_calls:
@@ -192,6 +212,14 @@ class LLMEngine:
                     )
                     func_args = {}
 
+                # Emit tool_call event to UI (so user sees what's being invoked)
+                yield {
+                    "type": "tool_call",
+                    "id": slot["id"],
+                    "name": func_name,
+                    "arguments": func_args,
+                }
+
                 handler = TOOL_REGISTRY.get(func_name)
                 if handler is None:
                     result = f"Unknown tool: {func_name}"
@@ -206,6 +234,14 @@ class LLMEngine:
                     f"🛠️ Tool call: {func_name}({func_args}) → "
                     f"{str(result)[:80]}..."
                 )
+
+                # Emit tool_result event to UI
+                yield {
+                    "type": "tool_result",
+                    "id": slot["id"],
+                    "name": func_name,
+                    "result": str(result),
+                }
 
                 # OpenAI tool result format
                 full_messages.append(
