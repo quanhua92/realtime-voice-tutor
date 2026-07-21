@@ -28,6 +28,47 @@ from .mcp_tools import TOOL_REGISTRY, TOOL_SCHEMAS
 logger = logging.getLogger("voicetutor.llm")
 
 
+def _log_request(
+    messages: list[dict],
+    tools_attached: bool,
+    round_idx: int | None = None,
+    total_rounds: int | None = None,
+) -> None:
+    """Log the full message list sent to the LLM for debugging.
+
+    Shows role + length + preview for each message so we can see exactly
+    what context the model is getting — useful for diagnosing 'AI is
+    stupid' complaints (often a context problem, not a model problem).
+    """
+    round_label = ""
+    if round_idx is not None and total_rounds is not None:
+        round_label = f" round {round_idx}/{total_rounds}"
+    logger.info(f"📨 LLM request{round_label} (tools={tools_attached}, {len(messages)} messages):")
+    for i, msg in enumerate(messages):
+        role = msg.get("role", "?")
+        content = msg.get("content") or ""
+        if isinstance(content, str):
+            preview = content[:300] + ("..." if len(content) > 300 else "")
+            preview = preview.replace("\n", " ⏎ ")
+        else:
+            preview = repr(content)[:300]
+        if role == "system":
+            logger.info(f"  [{i}] system ({len(content)} chars): {preview}")
+        elif role == "assistant" and msg.get("tool_calls"):
+            tcs = msg["tool_calls"]
+            tool_summary = ", ".join(
+                f"{tc['function']['name']}({tc['function']['arguments']})"
+                for tc in tcs
+            )
+            logger.info(f"  [{i}] assistant tool_calls ({len(tcs)}): {tool_summary}")
+            if content:
+                logger.info(f"        + content: {preview}")
+        elif role == "tool":
+            logger.info(f"  [{i}] tool result ({len(content)} chars): {preview}")
+        else:
+            logger.info(f"  [{i}] {role}: {preview}")
+
+
 class LLMEngine:
     """Async streaming LLM (OpenAI-compatible) with tool-calling loop."""
 
@@ -61,6 +102,7 @@ class LLMEngine:
         # as text when given the schema — disabling tools entirely avoids
         # that failure mode.
         if not TOOLS_ENABLED:
+            _log_request(full_messages, tools_attached=False)
             stream = await self.client.chat.completions.create(
                 model=self.model,
                 messages=full_messages,
@@ -75,6 +117,7 @@ class LLMEngine:
             return
 
         for round_idx in range(LLM_MAX_TOOL_ROUNDS):
+            _log_request(full_messages, tools_attached=True, round_idx=round_idx + 1, total_rounds=LLM_MAX_TOOL_ROUNDS)
             stream = await self.client.chat.completions.create(
                 model=self.model,
                 messages=full_messages,

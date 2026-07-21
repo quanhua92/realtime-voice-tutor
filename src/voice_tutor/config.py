@@ -56,12 +56,10 @@ ASR_COMPUTE_TYPE: str = os.getenv("ASR_COMPUTE_TYPE", "int8")
 # --- VAD ---
 VAD_THRESHOLD: float = _get_float("VAD_THRESHOLD", "0.6")
 # Barge-in threshold: VAD prob must exceed this during agent speech to
-# trigger interruption. 0.75 is a middle ground — 0.7 was catching too
-# much background noise, 0.85 was missing real interruptions. Observed
-# real-speech probs are 0.86-0.99 with AEC on; 0.75 catches those
-# comfortably while filtering quieter sounds. The 1200ms grace period
-# still protects against initial TTS-bleed.
-VAD_BARGE_IN_THRESHOLD: float = _get_float("VAD_BARGE_IN_THRESHOLD", "0.75")
+# trigger interruption. 0.85 catches normal-volume speech (observed
+# probs 0.85-0.99) while filtering background noise that occasionally
+# spikes to ~0.82. Below 0.85 produced false barge-ins on noise.
+VAD_BARGE_IN_THRESHOLD: float = _get_float("VAD_BARGE_IN_THRESHOLD", "0.85")
 VAD_SILENCE_TIMEOUT_MS: int = _get_int("VAD_SILENCE_TIMEOUT_MS", "800")
 # Grace period at the start of agent speech during which barge-in is
 # disabled entirely. Without this, agent TTS bleed into the mic triggers
