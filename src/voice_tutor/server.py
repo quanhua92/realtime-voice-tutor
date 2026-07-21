@@ -33,6 +33,7 @@ Critical correctness fixes vs. the original draft:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from contextlib import suppress
@@ -51,6 +52,7 @@ from .config import (
     PORT,
     PRE_SPEECH_MS,
     STATIC_DIR,
+    VAD_BARGE_IN_GRACE_MS,
 )
 from .engines import lifespan
 from .vad_engine import VADEngine
@@ -102,6 +104,18 @@ class Session:
         self.words_spoken: list[str] = []
         self.bytes_sent: int = 0
 
+        # Barge-in epoch — incremented on every interruption. The pipeline
+        # captures this at start and checks before each ws.send_bytes() to
+        # ensure no audio from a cancelled pipeline reaches the client.
+        self.barge_in_epoch: int = 0
+
+        # perf_counter timestamp when agent started speaking. Barge-in is
+        # suppressed for VAD_BARGE_IN_GRACE_MS after this — gives the agent
+        # time to finish its first sentence before the user can interrupt.
+        # Without this, TTS bleed or background noise within 500ms triggers
+        # false barge-ins before the user has even heard the agent.
+        self.agent_speaking_started_at: float = 0.0
+
         # Audio accumulation for ASR
         self.audio_buffer: bytearray = bytearray()
         # Rolling pre-speech buffer for low-latency speech-start capture
@@ -128,7 +142,34 @@ async def voice_endpoint(ws: WebSocket):
 
     try:
         while True:
-            data = await ws.receive_bytes()
+            # Receive either binary (mic PCM) or text (client JSON messages
+            # like AUDIO_DONE). Mixed receive so the client can notify us
+            # when its playback queue drains.
+            msg = await ws.receive()
+            if msg.get("type") == "websocket.disconnect":
+                break
+
+            if "text" in msg:
+                # JSON control message from client
+                try:
+                    control = json.loads(msg["text"])
+                except json.JSONDecodeError:
+                    continue
+                msg_type = control.get("type")
+                if msg_type == "AUDIO_DONE":
+                    # Client finished playing all queued audio — we can now
+                    # safely clear the agent-speaking state. This arrives
+                    # AFTER the server's END_OF_TURN because the client
+                    # plays the audio sequentially over several seconds.
+                    if session.is_agent_speaking:
+                        session.is_agent_speaking = False
+                        session.agent_speaking_started_at = 0.0
+                        logger.debug("Client reports AUDIO_DONE")
+                continue
+
+            if "bytes" not in msg:
+                continue
+            data = msg["bytes"]
             turn_start = time.perf_counter()
 
             # VAD: synchronous CPU work — off-thread so barge-in cancellation
@@ -142,43 +183,59 @@ async def voice_endpoint(ws: WebSocket):
             # ───────────────────────────────────────────────────────────
             # 1. BARGE-IN: User interrupts during agent TTS
             # ───────────────────────────────────────────────────────────
+            # Grace period: skip barge-in for VAD_BARGE_IN_GRACE_MS at the
+            # start of agent speech. The user can't physically hear + decide
+            # to interrupt in <1s; VAD triggers in that window are TTS bleed.
             if session.is_agent_speaking and vad_result["is_speech"]:
-                logger.info("⚡ BARGE-IN DETECTED — 4-Step Interruption")
-
-                # Step 1: Flush client audio buffer immediately
-                await ws.send_json({"type": "FLUSH"})
-
-                # Step 2: Cancel active LLM + TTS pipeline and AWAIT it
-                # so the CancelledError fully propagates before we proceed.
-                if session.active_task and not session.active_task.done():
-                    session.active_task.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await session.active_task
-
-                # Step 3: Halt agent speaking state
-                session.is_agent_speaking = False
-
-                # Step 4: State Reconstruction
-                # Trim chat history to reflect only what was actually synthesized.
-                spoken_text = " ".join(session.words_spoken)
-                if (
-                    session.chat_history
-                    and session.chat_history[-1]["role"] == "assistant"
-                ):
-                    session.chat_history[-1]["content"] = (
-                        spoken_text + " [interrupted]"
-                    )
-                    logger.info(
-                        f"State reconstructed: '{spoken_text[:80]}...'"
+                elapsed_ms = (time.perf_counter() - session.agent_speaking_started_at) * 1000
+                if elapsed_ms < VAD_BARGE_IN_GRACE_MS:
+                    logger.debug(
+                        f"VAD hit during grace period ({elapsed_ms:.0f}ms < "
+                        f"{VAD_BARGE_IN_GRACE_MS}ms), ignoring"
                     )
                 else:
                     logger.info(
-                        "Barge-in with no assistant turn to reconstruct"
+                        f"⚡ BARGE-IN DETECTED — 4-Step Interruption "
+                        f"(prob={vad_result['speech_prob']:.2f}, "
+                        f"{elapsed_ms:.0f}ms into agent speech)"
                     )
 
-                # Reset for new user turn — seed buffer with interrupting chunk
-                session.reset_after_barge_in(data)
-                continue
+                    # Increment epoch so the in-flight pipeline detects it
+                    # on its next ws.send_bytes() and aborts before sending.
+                    session.barge_in_epoch += 1
+
+                    # Step 1: Flush client audio buffer immediately
+                    await ws.send_json({"type": "FLUSH"})
+
+                    # Step 2: Cancel active LLM + TTS pipeline and AWAIT it
+                    if session.active_task and not session.active_task.done():
+                        session.active_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await session.active_task
+
+                    # Step 3: Halt agent speaking state
+                    session.is_agent_speaking = False
+
+                    # Step 4: State Reconstruction
+                    spoken_text = " ".join(session.words_spoken)
+                    if (
+                        session.chat_history
+                        and session.chat_history[-1]["role"] == "assistant"
+                    ):
+                        session.chat_history[-1]["content"] = (
+                            spoken_text + " [interrupted]"
+                        )
+                        logger.info(
+                            f"State reconstructed: '{spoken_text[:80]}...'"
+                        )
+                    else:
+                        logger.info(
+                            "Barge-in with no assistant turn to reconstruct"
+                        )
+
+                    # Reset for new user turn — seed buffer with interrupting chunk
+                    session.reset_after_barge_in(data)
+                    continue
 
             # ───────────────────────────────────────────────────────────
             # 2. ACCUMULATE: Buffer user audio during speech
@@ -263,18 +320,32 @@ async def run_response_pipeline(ws: WebSocket, session: Session):
     Runs as a background task so the WebSocket receive loop can keep
     pulling mic chunks for barge-in detection. Cancellable: barge-in
     cancels this task via session.active_task.cancel().
+
+    Barge-in epoch: captured at start, checked before every ws.send_*.
+    If the epoch changes mid-pipeline, we abort immediately to prevent
+    any audio/messages from a cancelled pipeline reaching the client.
     """
     pipeline_start = time.perf_counter()
+    my_epoch = session.barge_in_epoch
     full_response = ""
     sentence_buffer = ""
     first_audio_sent = False
 
+    def epoch_changed() -> bool:
+        return session.barge_in_epoch != my_epoch
+
     try:
         session.is_agent_speaking = True
+        session.agent_speaking_started_at = time.perf_counter()
         session.words_spoken.clear()
         session.bytes_sent = 0
 
         async for token in engines.llm_engine.generate_stream(session.chat_history):
+            # Check epoch BEFORE consuming more tokens
+            if epoch_changed():
+                logger.info("🛑 Pipeline epoch mismatch (LLM stream), aborting")
+                return
+
             sentence_buffer += token
             full_response += token
 
@@ -284,6 +355,11 @@ async def run_response_pipeline(ws: WebSocket, session: Session):
                 sentence_buffer = ""
                 if not sentence:
                     continue
+
+                # Check epoch before doing more work
+                if epoch_changed():
+                    logger.info("🛑 Pipeline epoch mismatch (pre-sentence), aborting")
+                    return
 
                 # Track words for state reconstruction (only what's synthesized)
                 session.words_spoken.extend(sentence.split())
@@ -297,6 +373,11 @@ async def run_response_pipeline(ws: WebSocket, session: Session):
                 pcm_bytes, sample_rate = await engines.tts_engine.synthesize(sentence)
                 if not pcm_bytes:
                     continue
+
+                # Check epoch after synthesis — barge-in may have fired meanwhile
+                if epoch_changed():
+                    logger.info("🛑 Pipeline epoch mismatch (post-TTS), dropping chunk")
+                    return
 
                 # Send sample-rate metadata before first audio chunk
                 if not first_audio_sent:
@@ -312,28 +393,37 @@ async def run_response_pipeline(ws: WebSocket, session: Session):
                 session.bytes_sent += len(pcm_bytes)
 
         # Flush any remaining text without punctuation
-        if sentence_buffer.strip():
+        if sentence_buffer.strip() and not epoch_changed():
             sentence = sentence_buffer.strip()
             session.words_spoken.extend(sentence.split())
             await ws.send_json(
                 {"type": "TRANSCRIPT", "role": "assistant", "text": sentence}
             )
             pcm_bytes, sample_rate = await engines.tts_engine.synthesize(sentence)
-            if pcm_bytes:
+            if pcm_bytes and not epoch_changed():
                 if not first_audio_sent:
                     await ws.send_json(
                         {"type": "AUDIO_START", "sample_rate": sample_rate}
                     )
                 await ws.send_bytes(pcm_bytes)
 
-        # Signal end of agent turn
-        await ws.send_json({"type": "END_OF_TURN"})
+        # Signal end of agent turn (only if not barge-in'd)
+        if not epoch_changed():
+            await ws.send_json({"type": "END_OF_TURN"})
 
-        # Append the complete response to history
-        session.chat_history.append(
-            {"role": "assistant", "content": full_response.strip()}
-        )
-        session.is_agent_speaking = False
+        # Append the complete response to history (only if not barge-in'd —
+        # the barge-in handler reconstructs history from words_spoken).
+        if not epoch_changed():
+            session.chat_history.append(
+                {"role": "assistant", "content": full_response.strip()}
+            )
+        # NOTE: is_agent_speaking stays True until the client sends
+        # AUDIO_DONE (when its playback queue drains). The server has
+        # finished sending all chunks but the client plays them
+        # sequentially over several more seconds; barge-in must remain
+        # possible during that window. If AUDIO_DONE never arrives
+        # (e.g., client disconnects), the next speech_ended cycle or
+        # barge-in will reset state.
 
         if LOG_LATENCY:
             total_ms = (time.perf_counter() - pipeline_start) * 1000

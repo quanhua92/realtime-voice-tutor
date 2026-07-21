@@ -21,6 +21,7 @@ from .config import (
     OPENAI_BASE_URL,
     OPENAI_MODEL,
     SYSTEM_PROMPT,
+    TOOLS_ENABLED,
 )
 from .mcp_tools import TOOL_REGISTRY, TOOL_SCHEMAS
 
@@ -54,6 +55,24 @@ class LLMEngine:
             {"role": "system", "content": SYSTEM_PROMPT}
         ]
         full_messages.extend(messages[-LLM_HISTORY_TURNS:])
+
+        # If tools are disabled, do a single streaming call with no tools.
+        # Small models like qwen3:0.6b hallucinate fake tool-call syntax
+        # as text when given the schema — disabling tools entirely avoids
+        # that failure mode.
+        if not TOOLS_ENABLED:
+            stream = await self.client.chat.completions.create(
+                model=self.model,
+                messages=full_messages,
+                stream=True,
+            )
+            async for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                if delta.content:
+                    yield delta.content
+            return
 
         for round_idx in range(LLM_MAX_TOOL_ROUNDS):
             stream = await self.client.chat.completions.create(

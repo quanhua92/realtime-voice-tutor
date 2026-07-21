@@ -44,17 +44,18 @@ def test_each_schema_is_valid_openai_format() -> None:
 
 def test_get_scenario_no_args_returns_a_scenario() -> None:
     result = get_scenario()
-    # Result is "**Title**\n\n# ... content"
+    # Result is "**Title**\n\n## Scenario N: ...\n\n- **Difficulty:**..."
     assert result.startswith("**")
-    assert len(result) > 200
-    # Should include key phrases or example dialogue
-    assert "Key Phrases" in result or "Example Dialogue" in result
+    assert len(result) > 100
+    # Should include scenario setup or key phrases
+    assert "Scenario" in result or "Difficulty" in result or "Can I" in result
 
 
 def test_get_scenario_by_category() -> None:
     result = get_scenario(category="restaurant")
     assert "Restaurant" in result
-    assert "Ordering Coffee" in result
+    # Should include key phrases section content
+    assert "Can I get" in result or "Ordering" in result or "phrase" in result.lower()
 
 
 def test_get_scenario_by_difficulty_beginner() -> None:
@@ -72,16 +73,18 @@ def test_get_scenario_invalid_category_falls_back() -> None:
 
 def test_lookup_phrases_known_category() -> None:
     result = lookup_phrases(category="restaurant")
-    assert "Ordering" in result or "Key Phrases" in result
+    # New compact format returns phrase + mistakes bodies (no section heading)
+    assert "Can I get" in result or "Could I get" in result
+    assert len(result) > 50
 
 
 def test_lookup_phrases_by_tag() -> None:
     result = lookup_phrases(category="small-talk")
-    # 'small-talk' tag matches both workplace and meeting-people — the loader
-    # returns the first match (workplace, alphabetically). Either way, the
-    # result should be a populated scenario body.
-    assert len(result) > 200
-    assert "Key Phrases" in result or "Common Mistakes" in result
+    # 'small-talk' tag matches both workplace and meeting-people — first match.
+    # Returns phrase bodies, no headings.
+    assert len(result) > 100
+    # Should contain some bullet-list phrase entries
+    assert '"' in result  # phrases are quoted
 
 
 def test_lookup_phrases_unknown_category() -> None:

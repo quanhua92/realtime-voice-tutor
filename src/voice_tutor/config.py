@@ -40,19 +40,35 @@ OPENAI_BASE_URL: str = os.getenv("OPENAI_BASE_URL", "http://localhost:11434/v1")
 # Local Ollama ignores the API key value but the SDK requires one to be set.
 # For cloud providers, set this to your real API key in .env.
 OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "ollama")
-OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gemma4:cloud")
+OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "qwen3:0.6b")
 LLM_HISTORY_TURNS: int = _get_int("LLM_HISTORY_TURNS", "10")
-LLM_MAX_TOOL_ROUNDS: int = _get_int("LLM_MAX_TOOL_ROUNDS", "3")
+LLM_MAX_TOOL_ROUNDS: int = _get_int("LLM_MAX_TOOL_ROUNDS", "2")
+# Small models like qwen3:0.6b hallucinate fake tool-call syntax as
+# plain text instead of using the API. Default off — flip to true when
+# using a stronger model (qwen3.5:2b, llama3.2:3b, etc).
+TOOLS_ENABLED: bool = _get_bool("TOOLS_ENABLED", "false")
 
 # --- ASR ---
-ASR_MODEL_SIZE: str = os.getenv("ASR_MODEL_SIZE", "tiny.en")
+ASR_MODEL_SIZE: str = os.getenv("ASR_MODEL_SIZE", str(MODELS_DIR / "asr" / "base.en"))
 ASR_DEVICE: str = os.getenv("ASR_DEVICE", "cpu")
 ASR_COMPUTE_TYPE: str = os.getenv("ASR_COMPUTE_TYPE", "int8")
 
 # --- VAD ---
 VAD_THRESHOLD: float = _get_float("VAD_THRESHOLD", "0.6")
-VAD_BARGE_IN_THRESHOLD: float = _get_float("VAD_BARGE_IN_THRESHOLD", "0.92")
-VAD_SILENCE_TIMEOUT_MS: int = _get_int("VAD_SILENCE_TIMEOUT_MS", "500")
+# Barge-in threshold: VAD prob must exceed this during agent speech to
+# trigger interruption. 0.75 is a middle ground — 0.7 was catching too
+# much background noise, 0.85 was missing real interruptions. Observed
+# real-speech probs are 0.86-0.99 with AEC on; 0.75 catches those
+# comfortably while filtering quieter sounds. The 1200ms grace period
+# still protects against initial TTS-bleed.
+VAD_BARGE_IN_THRESHOLD: float = _get_float("VAD_BARGE_IN_THRESHOLD", "0.75")
+VAD_SILENCE_TIMEOUT_MS: int = _get_int("VAD_SILENCE_TIMEOUT_MS", "800")
+# Grace period at the start of agent speech during which barge-in is
+# disabled entirely. Without this, agent TTS bleed into the mic triggers
+# false barge-ins within 500ms of the agent starting to speak — the user
+# hasn't even heard the agent yet. 1200ms gives the agent time to finish
+# its first sentence before interruption is allowed.
+VAD_BARGE_IN_GRACE_MS: int = _get_int("VAD_BARGE_IN_GRACE_MS", "1200")
 VAD_SAMPLE_RATE: int = _get_int("VAD_SAMPLE_RATE", "16000")
 VAD_CHUNK_SAMPLES: int = _get_int("VAD_CHUNK_SAMPLES", "512")
 SILERO_MODEL_PATH: str = os.getenv(
@@ -82,19 +98,22 @@ AUDIO_BYTES_PER_SAMPLE: int = 2  # int16 PCM
 PRE_SPEECH_MS: int = _get_int("PRE_SPEECH_MS", "200")  # rolling pre-speech buffer
 
 # --- System Prompt ---
-SYSTEM_PROMPT: str = """You are a friendly English conversation practice tutor called VoiceTutor.
+# Note: qwen3 family supports thinking mode. Ollama's /v1/ OpenAI-compat
+# endpoint does NOT forward the `think: false` parameter, so we suppress
+# thinking via the /no_think keyword in the prompt. This is essential for
+# latency — without it, qwen3.5:2b generates ~600 reasoning tokens before
+# answering, adding 2-4 seconds to every turn.
+SYSTEM_PROMPT: str = """/no_think
+You are a friendly English conversation practice partner. The user is practicing spoken English with you over voice. Your replies will be read aloud by a text-to-speech engine.
 
-Your role:
-1. Help users practice casual English through natural role-play conversations.
-2. Gently correct grammar and suggest more natural phrasing when appropriate.
-3. Use available tools to find relevant practice scenarios and useful phrases.
-4. Keep the conversation flowing naturally — don't be overly formal or lecture-like.
-5. After a few exchanges in a scenario, provide brief feedback on what went well.
-6. Adjust difficulty based on the user's apparent level.
-7. Keep responses under 2-3 sentences to feel conversational.
-
-When the user wants to practice, use get_scenario to find a relevant situation,
-then role-play that scenario with them. Use lookup_phrases to help when they're stuck.
+Rules:
+1. ROLE-PLAY in character. Pick a situation (café, airport, office, party, store, phone call) based on the user's first message and BE a real person in that situation. Don't describe the scenario or ask "what would you like to practice" — just start playing your role.
+2. Speak in 1-2 short sentences per turn. Use plain conversational English. The user needs time to talk too.
+3. Ask follow-up questions to keep the conversation moving.
+4. If the user makes a grammar mistake, reply naturally first, then offer a more natural phrasing in parentheses. Example: "Sure thing! (More natural: 'Could I get a coffee?')"
+5. Never output markdown, emoji, asterisks, bullet points, dashes, or any formatting characters — they get read aloud and sound bad.
+6. Never mention tools, scenarios, or topics as if they were features. Just have the conversation.
+7. Stay in character. Never say "as an AI" or "let me help you practice."
 """
 
 

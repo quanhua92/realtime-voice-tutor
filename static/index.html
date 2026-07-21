@@ -262,6 +262,8 @@
         let scheduledSources = [];
         let ttsSampleRate = 24000;
         let chosenSinkId = '';   // '' = system default; set by dropdown
+        let lastFlushTime = 0;  // ms timestamp of last FLUSH; used to drop in-flight chunks
+        let endOfTurnReceived = false;  // true after server says turn is done; cleared when queue drains
 
         // ────────────────────────────────────────────────────────────
         // Connect / disconnect
@@ -283,6 +285,7 @@
             ws.binaryType = 'arraybuffer';
 
             ws.onopen = async () => {
+                console.log('[ws] connected');
                 setStatus('connected', 'Connected & Listening');
                 btn.textContent = 'Stop';
                 btn.classList.add('active');
@@ -299,11 +302,13 @@
                     const msg = JSON.parse(event.data);
                     handleMessage(msg);
                 } else {
+                    console.log(`[ws] ← binary chunk (${event.data.byteLength} bytes)`);
                     queueAudio(event.data);
                 }
             };
 
             ws.onclose = () => {
+                console.log('[ws] closed');
                 setStatus('disconnected', 'Disconnected');
                 btn.textContent = 'Start Talking';
                 btn.classList.remove('active');
@@ -311,7 +316,8 @@
                 flushAudio();
             };
 
-            ws.onerror = () => {
+            ws.onerror = (e) => {
+                console.log('[ws] error', e);
                 setStatus('disconnected', 'Connection Error');
             };
         }
@@ -320,21 +326,35 @@
             switch (msg.type) {
                 case 'FLUSH':
                     // Barge-in: immediately stop all audio
+                    console.log('[ws] ← FLUSH (barge-in)');
                     flushAudio();
                     break;
                 case 'TRANSCRIPT':
+                    console.log(`[ws] ← TRANSCRIPT ${msg.role}: ${msg.text.slice(0, 60)}`);
                     appendMessage(msg.role, msg.text);
                     if (msg.role === 'assistant') {
                         setStatus('speaking', 'Agent Speaking...');
                     }
                     break;
                 case 'AUDIO_START':
+                    console.log(`[ws] ← AUDIO_START sample_rate=${msg.sample_rate}`);
                     ttsSampleRate = msg.sample_rate || 24000;
                     break;
                 case 'END_OF_TURN':
+                    console.log('[ws] ← END_OF_TURN');
+                    endOfTurnReceived = true;
+                    // If playback queue is already empty (e.g., very short
+                    // response), send AUDIO_DONE immediately so the server
+                    // doesn't keep is_agent_speaking=True indefinitely.
+                    if (scheduledSources.length === 0 && ws && ws.readyState === WebSocket.OPEN) {
+                        console.log('[ws] → AUDIO_DONE (queue empty at END_OF_TURN)');
+                        ws.send(JSON.stringify({ type: 'AUDIO_DONE' }));
+                        endOfTurnReceived = false;
+                    }
                     setStatus('connected', 'Connected & Listening');
                     break;
                 case 'ERROR':
+                    console.log(`[ws] ← ERROR: ${msg.message}`);
                     appendMessage('system', `⚠️ ${msg.message}`);
                     break;
             }
@@ -354,13 +374,34 @@
             // Bluetooth headset call channel). We let the user pick a media
             // output device via setSinkId to override this — and system AEC
             // follows the new output, so we keep echo cancellation benefits.
+            const aecOn = document.getElementById('aecToggle').checked;
+            console.log(`[mic] requesting getUserMedia with AEC=${aecOn}`);
             micStream = await navigator.mediaDevices.getUserMedia({
                 audio: {
-                    echoCancellation: true,
-                    noiseSuppression: true,
-                    autoGainControl: true,
+                    echoCancellation: aecOn,
+                    noiseSuppression: aecOn,
+                    autoGainControl: aecOn,
                 }
             });
+
+            // Verify what the browser actually granted us — the constraints
+            // are HINTS, not requirements. Log the effective settings so we
+            // can debug "why is AEC off" type questions.
+            const track = micStream.getAudioTracks()[0];
+            const settings = track.getSettings();
+            console.log('[mic] actual track settings:', {
+                echoCancellation: settings.echoCancellation,
+                noiseSuppression: settings.noiseSuppression,
+                autoGainControl: settings.autoGainControl,
+                sampleRate: settings.sampleRate,
+                sampleSize: settings.sampleSize,
+                channelCount: settings.channelCount,
+                label: track.label,
+            });
+            if (settings.echoCancellation !== aecOn) {
+                console.warn(`[mic] WARNING: requested AEC=${aecOn} but browser gave us AEC=${settings.echoCancellation}`);
+                appendMessage('system', `⚠️ Browser ignored AEC request — got echoCancellation=${settings.echoCancellation}`);
+            }
 
             // Populate the output device picker.
             // Chrome hides device labels until mic permission is granted,
@@ -473,7 +514,11 @@
             // Toggling AEC requires re-acquiring the mic stream with new constraints.
             // This MUST happen after a user gesture (the toggle click qualifies).
             const aecOn = document.getElementById('aecToggle').checked;
-            if (!micStream) return;  // not started yet
+            console.log(`[aec] toggle clicked → aecOn=${aecOn}`);
+            if (!micStream) {
+                console.log('[aec] mic not started yet, ignoring');
+                return;
+            }
 
             // Stop existing tracks and worklet
             if (workletNode) { try { workletNode.disconnect(); } catch(e) {} workletNode = null; }
@@ -484,6 +529,7 @@
 
             // Re-acquire mic with the new AEC setting
             try {
+                console.log(`[aec] re-acquiring mic with AEC=${aecOn}`);
                 micStream = await navigator.mediaDevices.getUserMedia({
                     audio: {
                         echoCancellation: aecOn,
@@ -496,6 +542,19 @@
                 // Re-check the box since we couldn't actually change it
                 document.getElementById('aecToggle').checked = !aecOn;
                 return;
+            }
+
+            // Verify the browser actually honored the AEC change
+            const track = micStream.getAudioTracks()[0];
+            const settings = track.getSettings();
+            console.log('[aec] new actual settings:', {
+                echoCancellation: settings.echoCancellation,
+                noiseSuppression: settings.noiseSuppression,
+                autoGainControl: settings.autoGainControl,
+            });
+            if (settings.echoCancellation !== aecOn) {
+                console.warn(`[aec] browser ignored request — wanted AEC=${aecOn}, got AEC=${settings.echoCancellation}`);
+                appendMessage('system', `⚠️ Browser ignored AEC toggle — wanted ${aecOn}, got ${settings.echoCancellation}`);
             }
 
             // Rewire worklet → mute → destination
@@ -517,6 +576,15 @@
         }
 
         function queueAudio(arrayBuffer) {
+            // Defense-in-depth: drop chunks arriving within 250ms of a FLUSH.
+            // These are in-flight chunks the server sent just before/during
+            // barge-in cancellation. The server's epoch check should already
+            // prevent them, but WebSocket buffering can still slip one through.
+            if (lastFlushTime && (Date.now() - lastFlushTime) < 250) {
+                console.log(`[audio] 🛑 dropping in-flight chunk (post-FLUSH window, ${Date.now() - lastFlushTime}ms)`);
+                return;
+            }
+
             if (!playbackCtx) {
                 // Pass sinkId AT CONSTRUCTION (Chrome 110+) — this is the
                 // documented way to override Chrome's "communications" mode
@@ -524,9 +592,11 @@
                 // See https://developer.chrome.com/blog/audiocontext-setsinkid
                 try {
                     playbackCtx = new AudioContext({ sinkId: chosenSinkId });
+                    console.log(`[audio] created playbackCtx (sinkId=${chosenSinkId || 'default'}, sr=${playbackCtx.sampleRate})`);
                 } catch (e) {
                     // Older browsers may not accept sinkId in constructor
                     playbackCtx = new AudioContext();
+                    console.log(`[audio] created playbackCtx (fallback, sr=${playbackCtx.sampleRate})`);
                 }
                 nextPlayTime = playbackCtx.currentTime;
             }
@@ -554,10 +624,30 @@
             src.onended = () => {
                 const idx = scheduledSources.indexOf(src);
                 if (idx > -1) scheduledSources.splice(idx, 1);
+                // When the last scheduled source finishes playing AND we've
+                // received END_OF_TURN, notify the server. The server keeps
+                // is_agent_speaking=True until this arrives so barge-in can
+                // still fire while audio is playing on the client (the server
+                // has already finished sending but the user is still hearing
+                // the agent's voice).
+                if (scheduledSources.length === 0 && endOfTurnReceived && ws && ws.readyState === WebSocket.OPEN) {
+                    console.log('[ws] → AUDIO_DONE (playback queue drained)');
+                    ws.send(JSON.stringify({ type: 'AUDIO_DONE' }));
+                    endOfTurnReceived = false;
+                }
             };
         }
 
         function flushAudio() {
+            console.log('⚡ FLUSH — stopping all audio');
+            // Mark the time so queueAudio can drop in-flight chunks that
+            // arrive within 250ms (defense against WebSocket buffering).
+            lastFlushTime = Date.now();
+            // Cancel any pending AUDIO_DONE — the server's FLUSH already
+            // tells it to reset state; we don't want a stale AUDIO_DONE
+            // arriving afterwards and confusing the next turn.
+            endOfTurnReceived = false;
+
             // Barge-in: stop everything immediately.
             scheduledSources.forEach(s => {
                 try { s.stop(); } catch (e) {}

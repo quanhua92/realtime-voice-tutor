@@ -20,6 +20,48 @@ from .data_loader import DataLoader
 data = DataLoader("data")
 
 
+def _extract_section(content: str, heading: str) -> str:
+    """Extract a Markdown `### Heading` section body (up to the next ### ).
+
+    Returns the section as a single trimmed string, or '' if not found.
+    """
+    lines = content.splitlines()
+    out: list[str] = []
+    in_section = False
+    for line in lines:
+        if line.lstrip().startswith("###"):
+            if in_section:
+                break  # next ### → end of our section
+            if heading.lower() in line.lower():
+                in_section = True
+                continue
+        elif in_section:
+            out.append(line)
+    return "\n".join(out).strip()
+
+
+def _extract_first_setup(content: str) -> str:
+    """Extract the first sub-scenario's setup (Difficulty + Setting lines).
+
+    Returns a short multi-line string, or '' if not found.
+    """
+    lines = content.splitlines()
+    out: list[str] = []
+    in_scenario = False
+    for line in lines:
+        if line.startswith("## Scenario"):
+            if in_scenario:
+                break  # next scenario → stop
+            in_scenario = True
+            out.append(line)
+            continue
+        if in_scenario:
+            stripped = line.lstrip(" -")
+            if stripped.startswith("**Difficulty:**") or stripped.startswith("**Setting:**"):
+                out.append(line)
+    return "\n".join(out).strip()
+
+
 def get_scenario(
     category: Optional[str] = None,
     difficulty: Optional[str] = None,
@@ -33,8 +75,8 @@ def get_scenario(
         difficulty: beginner / intermediate / advanced. Optional.
 
     Returns:
-        Scenario content with role-play setup, key phrases, and examples.
-        If multiple scenarios match, one is chosen at random.
+        Title + first sub-scenario's setup + Key Phrases (compact form,
+        not the whole file — keeps LLM context small).
     """
     results = data.find_scenarios(category=category, difficulty=difficulty)
     if not results:
@@ -45,7 +87,17 @@ def get_scenario(
 
     chosen = random.choice(results)
     title = chosen["meta"].get("title", chosen["name"])
-    return f"**{title}**\n\n{chosen['content']}"
+    # Extract only the first sub-scenario's Key Phrases to keep the
+    # tool result short. Returning the whole file burns LLM context
+    # and encourages the model to call more tools.
+    phrases = _extract_section(chosen["content"], "Key Phrases")
+    setup = _extract_first_setup(chosen["content"])
+    parts = [f"**{title}**"]
+    if setup:
+        parts.append(setup)
+    if phrases:
+        parts.append(phrases)
+    return "\n\n".join(parts) if len(parts) > 1 else parts[0]
 
 
 def lookup_phrases(category: str) -> str:
@@ -57,7 +109,7 @@ def lookup_phrases(category: str) -> str:
             or a tag (e.g. 'small-talk', 'ordering').
 
     Returns:
-        Key phrases and common mistakes for the matched scenario.
+        Key Phrases + Common Mistakes sections only (compact).
     """
     results = data.find_scenarios(category=category)
     if not results:
@@ -66,7 +118,15 @@ def lookup_phrases(category: str) -> str:
         available = ", ".join(data.get_all_categories())
         return f"No phrases found for '{category}'. Try: {available}"
 
-    return results[0]["content"]
+    content = results[0]["content"]
+    phrases = _extract_section(content, "Key Phrases")
+    mistakes = _extract_section(content, "Common Mistakes")
+    parts = []
+    if phrases:
+        parts.append(phrases)
+    if mistakes:
+        parts.append(mistakes)
+    return "\n\n".join(parts) if parts else content[:500]
 
 
 def check_vocabulary(word: str) -> str:
